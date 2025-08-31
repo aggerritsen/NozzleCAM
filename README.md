@@ -72,6 +72,8 @@ project/
 
 This guide describes a compact, robust tube build for the **LilyGO TTGO T-Journal (ESP32 + OV2640 + OLED)** with a **single 21700 Li-ion cell** in-line behind the board. It’s designed for browser-based live video (AP mode) at **http://192.168.4.1** using the PlatformIO firmware in this repo.
 
+![HornetsCAM](doc/HornetsCAM.png)
+
 ---
 
 ## 1) Overview
@@ -139,7 +141,7 @@ This guide describes a compact, robust tube build for the **LilyGO TTGO T-Journa
 ---
 
 ## 4) Wiring (text schematic)
-
+```
 [21700 Cell] + ----> [PCM B+] (battery protection)
 - ----> [PCM B-]
 
@@ -147,7 +149,7 @@ This guide describes a compact, robust tube build for the **LilyGO TTGO T-Journa
 [PCM P-] ---------------------> JST-PH - --> T-Journal GND
 
 Antenna: u.FL (board) --> u.FL-to-SMA pigtail --> SMA bulkhead (rear cap) --> SMA antenna
-
+```
 
 **Notes**
 - Keep leads **short**. Add **heat-shrink** over joints.
