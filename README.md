@@ -3,9 +3,9 @@
 This project turns the **LilyGO TTGO T-Journal (ESP32 + OV2640 + OLED)** into a **standalone Wi-Fi camera**.  
 It starts its own Wi-Fi hotspot (AP mode) and serves **live MJPEG video** directly to your phone or laptop via a browser — no apps required.
 
+![TTGO T-Journal OLED](doc\LILYGO%20TTGO%20T-Journal_normal_01-1500x1500w.jpg)
 
 ![TTGO T-Journal](doc/LILYGO%20TTGO%20T-Journal_normal_02-1500x1500.jpg)
-
 
 ---
 
