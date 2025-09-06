@@ -1,0 +1,3 @@
+SHA256 hash of factory_ttgo_tjournal_4MB.bin:
+d3b5626591bdc2b61adccc8a822c0e05b518808573deec6debd0986fceafc3f2
+CertUtil: -hashfile command completed successfully.
