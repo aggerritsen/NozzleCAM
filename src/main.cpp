@@ -1,19 +1,10 @@
 /**
  * TTGO T-Journal (ESP32 + OV2640 + OLED 0.91" SSD1306 128x32)
  * - Wi-Fi Access Point with browser UI at http://192.168.4.1
- * - Live MJPEG stream at  http://192.168.4.1/stream
- * - /control?var=framesize|quality&val=...
+ * - Live MJPEG stream at  /stream   (same server/port)
  * - OLED shows SSID / IP / status
  * - DNS wildcard -> http://nozzlecam/
  * - mDNS responder -> http://nozzcam.local/
- * - Captive portal redirects (auto-open on most devices)
- *
- * PlatformIO (suggested):
- *   board = esp-wrover-kit   (or esp32dev if no PSRAM)
- *   board_build.partitions = huge_app.csv
- *   build_flags = -DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue
- *                 -DCAMERA_MODEL_T_JOURNAL -DI2C_SDA=14 -DI2C_SCL=13
- *   lib_deps = adafruit/Adafruit SSD1306, adafruit/Adafruit GFX Library
  */
 
 #include <Arduino.h>
@@ -26,11 +17,11 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
-// ---------- DNS & mDNS ----------
+// DNS & mDNS
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 
-// ---------- OLED ----------
+// OLED
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -52,9 +43,9 @@ static const bool  AP_HIDDEN   = false;
 #define OLED_HEIGHT   32
 #define OLED_ADDR   0x3C
 
-// ======= STREAM DEFAULTS =======
-framesize_t STREAM_SIZE = FRAMESIZE_VGA;  // QVGA..XGA reasonable
-int JPEG_QUALITY = 12;                    // 10..20 (lower=better)
+// ======= STREAM DEFAULTS (max-ish quality) =======
+framesize_t STREAM_SIZE = FRAMESIZE_UXGA; // 1600x1200 (needs PSRAM)
+int JPEG_QUALITY = 10;                    // lower = better image, bigger size
 int FB_COUNT     = 2;                     // 2 with PSRAM, else 1
 
 // ======= CAMERA PINS: TTGO T-JOURNAL =======
@@ -78,8 +69,6 @@ int FB_COUNT     = 2;                     // 2 with PSRAM, else 1
 // ======= GLOBALS =======
 httpd_handle_t httpd_ctrl = NULL; // single server on port 80
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
-
-// DNS (wildcard) + mDNS
 DNSServer dnsServer;
 const byte DNS_PORT = 53;
 
@@ -108,9 +97,7 @@ static void oledPrintCentered(const String& line1, const String& line2 = "") {
 
 static void oledBoot() {
   Wire.begin(I2C_SDA, I2C_SCL);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    return; // continue without OLED
-  }
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) return;
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
@@ -159,49 +146,9 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     if (fb) { esp_camera_fb_return(fb); fb = NULL; _jpg_buf = NULL; }
     else if (_jpg_buf) { free(_jpg_buf); _jpg_buf = NULL; }
 
-    vTaskDelay(1); // friendly yield
+    vTaskDelay(1);
   }
   return res;
-}
-
-// ---------- HTTP: command handler ----------
-static esp_err_t cmd_handler(httpd_req_t *req) {
-  char*  buf;
-  size_t buf_len;
-  char var[32] = {0};
-  char val[32] = {0};
-
-  buf_len = httpd_req_get_url_query_len(req) + 1;
-  if (buf_len <= 1) return httpd_resp_send_404(req);
-
-  buf = (char*)malloc(buf_len);
-  if(!buf) return ESP_FAIL;
-  if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
-    httpd_query_key_value(buf, "var", var, sizeof(var));
-    httpd_query_key_value(buf, "val", val, sizeof(val));
-  }
-  free(buf);
-
-  sensor_t * s = esp_camera_sensor_get();
-  int val_i = atoi(val);
-
-  if (!strcmp(var, "framesize")) {
-    if (val_i >= 0 && val_i <= 13) s->set_framesize(s, (framesize_t)val_i);
-  } else if (!strcmp(var, "quality")) {
-    if (val_i >= 5 && val_i <= 63) s->set_quality(s, val_i);
-  }
-
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_sendstr(req, "OK");
-}
-
-// ---------- HTTP: captive-portal redirect ----------
-static esp_err_t captive_handler(httpd_req_t *req) {
-  httpd_resp_set_status(req, "302 Found");
-  httpd_resp_set_hdr(req, "Location", "/");
-  httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
-  httpd_resp_send(req, "", 0);
-  return ESP_OK;
 }
 
 // ---------- HTTP: index page ----------
@@ -220,70 +167,170 @@ static esp_err_t index_handler(httpd_req_t *req) {
     padding:.5rem .75rem;background:rgba(0,0,0,.4);backdrop-filter:blur(6px)
   }
   .left, .right{display:flex;gap:.5rem;align-items:center}
-  button,select{font-size:16px;padding:.45rem .7rem;background:#111;color:#fff;border:1px solid #333;border-radius:.5rem}
+  button{
+    font-size:16px;padding:.45rem .7rem;background:#111;color:#fff;border:1px solid #333;border-radius:.5rem
+  }
   #stage{
     position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
   }
   #stream{
     display:block;width:100vw;height:100vh;object-fit:contain;background:#000;touch-action:none;
   }
+  canvas{display:none}
 </style>
 </head><body>
   <div class="bar">
-    <div class="left">
-      <strong>NozzleCAM</strong>
-      <button id="start">Start</button>
-      <button id="stop">Stop</button>
-      <label>Size
-        <select id="framesize">
-          <option value="5">QVGA</option>
-          <option value="6" selected>VGA</option>
-          <option value="7">SVGA</option>
-          <option value="8">XGA</option>
-        </select>
-      </label>
-      <label>Quality
-        <select id="quality">
-          <option>10</option><option selected>12</option><option>14</option><option>16</option><option>20</option>
-        </select>
-      </label>
-    </div>
+    <div class="left"><strong>NozzleCAM</strong></div>
     <div class="right">
+      <button id="shot">Snapshot</button>
+      <button id="rec">Record</button>
       <button id="fs">Fullscreen</button>
     </div>
   </div>
 
   <div id="stage">
     <img id="stream" alt="Live stream">
+    <canvas id="cvs"></canvas>
   </div>
 
 <script>
   const img = document.getElementById('stream');
-  const streamURL = '/stream';       // same server/port
+  const cvs = document.getElementById('cvs');
+  const ctx = cvs.getContext('2d');
 
-  const start = () => { img.src = streamURL; };
-  const stop  = () => { img.src = ''; };
+  // Always start the MJPEG stream immediately
+  const streamURL = '/stream';
+  img.src = streamURL;
 
-  document.getElementById('start').onclick = start;
-  document.getElementById('stop').onclick  = stop;
-
-  document.getElementById('framesize').onchange = (e) =>
-    fetch(`/control?var=framesize&val=${e.target.value}`).catch(()=>{});
-  document.getElementById('quality').onchange   = (e) =>
-    fetch(`/control?var=quality&val=${e.target.value}`).catch(()=>{});
-
-  const toFS = () => {
+  // Fullscreen
+  document.getElementById('fs').onclick = () => {
     const el = document.documentElement;
-    if (document.fullscreenElement) return document.exitFullscreen();
-    if (el.requestFullscreen) el.requestFullscreen();
+    if (document.fullscreenElement) document.exitFullscreen();
+    else if (el.requestFullscreen) el.requestFullscreen();
   };
-  document.getElementById('fs').onclick = toFS;
 
-  window.addEventListener('load', () => start(), { once:true });
+  // Helper: set canvas to current image dimensions
+  function syncCanvasToImage(){
+    const w = img.naturalWidth || img.videoWidth || img.width;
+    const h = img.naturalHeight || img.videoHeight || img.height;
+    if (w && h && (cvs.width !== w || cvs.height !== h)) {
+      cvs.width = w; cvs.height = h;
+    }
+  }
+
+  // Snapshot (client-side): draw current frame to canvas and download JPEG
+  document.getElementById('shot').onclick = async () => {
+    try{
+      syncCanvasToImage();
+      if (!cvs.width || !cvs.height) { alert('No frame yet.'); return; }
+      ctx.drawImage(img, 0, 0, cvs.width, cvs.height);
+      cvs.toBlob((blob)=>{
+        if (!blob) return;
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        const ts = new Date().toISOString().replace(/[:.]/g,'-');
+        a.download = `NozzleCAM_${ts}.jpg`;
+        document.body.appendChild(a);
+        a.click();
+        showMsg("Snapshot saved");
+        setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 500);
+      }, 'image/jpeg', 0.95);
+    }catch(e){
+      showMsg("Snapshot failed"); 
+      console.error(e); 
+    }
+  };
+
+  // Recording (client-side): draw frames to canvas at ~20 fps, record canvas stream
+  let rec = null, chunks = [], drawTimer = null;
+  document.getElementById('rec').onclick = () => {
+    if (rec && rec.state !== 'inactive') {
+      // Stop recording
+      clearInterval(drawTimer); drawTimer = null;
+      rec.stop();
+      return;
+    }
+    if (typeof MediaRecorder === 'undefined') {
+      alert('Recording not supported by this browser. Snapshot still works.');
+      showMsg("Recording not supported");
+      return;
+    }
+    syncCanvasToImage();
+    if (!cvs.width || !cvs.height) { alert('No frame yet.'); return; }
+
+    // draw loop: copy IMG → canvas periodically
+    const fps = 20;
+    drawTimer = setInterval(()=>{
+      try{
+        if (!img.complete) return;
+        // if resolution changes mid-stream, resync canvas
+        if (img.naturalWidth && (img.naturalWidth !== cvs.width || img.naturalHeight !== cvs.height)) {
+          cvs.width = img.naturalWidth; cvs.height = img.naturalHeight;
+        }
+        ctx.drawImage(img, 0, 0, cvs.width, cvs.height);
+      }catch(e){}
+    }, Math.round(1000/fps));
+
+    const stream = cvs.captureStream(fps);
+    chunks = [];
+    let mime = 'video/webm;codecs=vp9';
+    if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp8';
+    if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
+
+    try {
+      rec = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: 5_000_000});
+    } catch(e) {
+      alert('This browser does not support WebM recording.'); clearInterval(drawTimer); return;
+    }
+
+    rec.ondataavailable = (ev)=>{ if (ev.data && ev.data.size) chunks.push(ev.data); };
+    rec.onstop = ()=>{
+      const blob = new Blob(chunks, {type: chunks[0]?.type || 'video/webm'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      const ts = new Date().toISOString().replace(/[:.]/g,'-');
+      a.download = `NozzleCAM_${ts}.webm`;
+      document.body.appendChild(a);
+      a.click();
+      showMsg("Video saved");
+      setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+      document.getElementById('rec').textContent = 'Record';
+    };
+
+    rec.start(1000); // collect in 1s chunks
+    document.getElementById('rec').textContent = 'Stop';
+  };
+
+  // Nudge reflow on orientation change (image scales via CSS)
   window.addEventListener('orientationchange', () => {
     img.style.transform='translateZ(0)'; setTimeout(()=>img.style.transform='',100);
   });
 </script>
+
+<!-- Toast message container -->
+<div id="msg" style="
+  position:fixed;
+  bottom:1rem;
+  left:50%;
+  transform:translateX(-50%);
+  background:#111;
+  color:#fff;
+  padding:.5rem 1rem;
+  border-radius:.5rem;
+  font-size:14px;
+  display:none;
+  z-index:999">
+</div>
+
+<script>
+function showMsg(text) {
+  const m = document.getElementById('msg');
+  m.textContent = text;
+  m.style.display = 'block';
+  setTimeout(()=>m.style.display='none', 3000);
+}
+</script>
+
 </body></html>
 )HTML";
 
@@ -298,34 +345,16 @@ static void startCameraServer(){
   cfg.uri_match_fn = httpd_uri_match_wildcard;
 
   httpd_uri_t index_uri  = { .uri="/",        .method=HTTP_GET, .handler=index_handler, .user_ctx=NULL };
-  httpd_uri_t cmd_uri    = { .uri="/control", .method=HTTP_GET, .handler=cmd_handler,   .user_ctx=NULL };
   httpd_uri_t stream_uri = { .uri="/stream",  .method=HTTP_GET, .handler=stream_handler,.user_ctx=NULL };
-
-  // captive-portal probes (redirect to "/")
-  httpd_uri_t cp_g204  = { .uri="/generate_204",        .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
-  httpd_uri_t cp_hotsp = { .uri="/hotspot-detect.html", .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
-  httpd_uri_t cp_ms    = { .uri="/ncsi.txt",            .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
-  httpd_uri_t cp_ms2   = { .uri="/connecttest.txt",     .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
-  httpd_uri_t cp_fw    = { .uri="/fwlink",              .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
-  httpd_uri_t cp_wpad  = { .uri="/wpad.dat",            .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
 
   if (httpd_start(&httpd_ctrl, &cfg) == ESP_OK) {
     httpd_register_uri_handler(httpd_ctrl, &index_uri);
-    httpd_register_uri_handler(httpd_ctrl, &cmd_uri);
     httpd_register_uri_handler(httpd_ctrl, &stream_uri);
-
-    httpd_register_uri_handler(httpd_ctrl, &cp_g204);
-    httpd_register_uri_handler(httpd_ctrl, &cp_hotsp);
-    httpd_register_uri_handler(httpd_ctrl, &cp_ms);
-    httpd_register_uri_handler(httpd_ctrl, &cp_ms2);
-    httpd_register_uri_handler(httpd_ctrl, &cp_fw);
-    httpd_register_uri_handler(httpd_ctrl, &cp_wpad);
   }
 }
 
 // ---------- Setup ----------
 void setup() {
-  // Some boards need brownout disable
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 
   Serial.begin(115200);
@@ -358,17 +387,17 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 16500000;          // gentler than 20 MHz
+  config.xclk_freq_hz = 16500000;
   config.pixel_format = PIXFORMAT_JPEG;
 
   if (psramFound()) {
-    config.frame_size   = STREAM_SIZE;     // e.g., FRAMESIZE_VGA
-    config.jpeg_quality = JPEG_QUALITY;    // 10..20 (lower = better)
+    config.frame_size   = STREAM_SIZE;     // UXGA
+    config.jpeg_quality = JPEG_QUALITY;    // 10
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
   } else {
-    config.frame_size   = FRAMESIZE_QVGA;  // start small (320x240)
-    config.jpeg_quality = 20;              // higher number -> smaller frames
+    config.frame_size   = FRAMESIZE_SVGA;  // safer without PSRAM
+    config.jpeg_quality = 12;
     config.fb_count     = 1;
     config.fb_location  = CAMERA_FB_IN_DRAM;
   }
@@ -383,13 +412,9 @@ void setup() {
     Serial.printf("Sensor PID=0x%02X, VER=0x%02X, MIDL=0x%02X, MIDH=0x%02X\n",
       s->id.PID, s->id.VER, s->id.MIDL, s->id.MIDH);
 
-    s->set_framesize(s, STREAM_SIZE);
+    s->set_framesize(s, psramFound() ? STREAM_SIZE : FRAMESIZE_SVGA);
     s->set_quality(s, JPEG_QUALITY);
-
-    // DEBUG: enable once to verify capture, then set back to 0
     if (s->set_colorbar) s->set_colorbar(s, 0);
-
-    // Nice defaults
     if (s->set_gain_ctrl)     s->set_gain_ctrl(s, 1);
     if (s->set_exposure_ctrl) s->set_exposure_ctrl(s, 1);
     if (s->set_whitebal)      s->set_whitebal(s, 1);
@@ -408,19 +433,18 @@ void setup() {
   Serial.print("SSID: "); Serial.println(AP_SSID);
   Serial.print("IP:   "); Serial.println(ip);
 
-  // DNS wildcard -> resolve all names to us (captive-portal style)
+  // DNS wildcard -> http://nozzlecam/
   dnsServer.start(DNS_PORT, "*", ip);
   Serial.println("DNS server started (wildcard): http://nozzlecam/");
 
-  // mDNS responder -> nozzcam.local
+  // mDNS -> http://nozzcam.local/
   if (MDNS.begin("nozzcam")) {
     Serial.println("mDNS: http://nozzcam.local");
   } else {
     Serial.println("mDNS setup failed");
   }
 
-  String ipStr = ip.toString();
-  oledPrintCentered(AP_SSID, ipStr);
+  oledPrintCentered(AP_SSID, ip.toString());
 
   startCameraServer();
   Serial.println("UI:     http://192.168.4.1");
@@ -429,8 +453,5 @@ void setup() {
 }
 
 void loop() {
-  // Keep DNS server responsive
-  dnsServer.processNextRequest();
-
-  // webserver & stream run in background tasks
+  dnsServer.processNextRequest(); // keep DNS responsive
 }
