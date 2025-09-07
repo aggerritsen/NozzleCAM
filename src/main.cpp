@@ -1,12 +1,15 @@
 /**
  * TTGO T-Journal (ESP32 + OV2640 + OLED 0.91" SSD1306 128x32)
  * - Wi-Fi Access Point with browser UI at http://192.168.4.1
- * - Live MJPEG stream at  http://192.168.4.1:81/stream
+ * - Live MJPEG stream at  http://192.168.4.1/stream
  * - /control?var=framesize|quality&val=...
  * - OLED shows SSID / IP / status
+ * - DNS wildcard -> http://nozzlecam/
+ * - mDNS responder -> http://nozzcam.local/
+ * - Captive portal redirects (auto-open on most devices)
  *
  * PlatformIO (suggested):
- *   board = esp-wrover-kit
+ *   board = esp-wrover-kit   (or esp32dev if no PSRAM)
  *   board_build.partitions = huge_app.csv
  *   build_flags = -DBOARD_HAS_PSRAM -mfix-esp32-psram-cache-issue
  *                 -DCAMERA_MODEL_T_JOURNAL -DI2C_SDA=14 -DI2C_SCL=13
@@ -23,6 +26,10 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
+// ---------- DNS & mDNS ----------
+#include <DNSServer.h>
+#include <ESPmDNS.h>
+
 // ---------- OLED ----------
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -30,7 +37,7 @@
 
 // ======= AP CONFIG =======
 static const char* AP_SSID     = "NozzleCAM";
-static const char* AP_PASSWORD = "";   // >= 8 chars
+static const char* AP_PASSWORD = "";   // empty -> open network
 static const int   AP_CHANNEL  = 6;
 static const bool  AP_HIDDEN   = false;
 
@@ -69,9 +76,12 @@ int FB_COUNT     = 2;                     // 2 with PSRAM, else 1
 #define PCLK_GPIO_NUM  21
 
 // ======= GLOBALS =======
-httpd_handle_t httpd_ctrl  = NULL; // port 80
-httpd_handle_t httpd_stream= NULL; // port 81
+httpd_handle_t httpd_ctrl = NULL; // single server on port 80
 Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+
+// DNS (wildcard) + mDNS
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
 
 // ---------- OLED helpers ----------
 static void oledPrintCentered(const String& line1, const String& line2 = "") {
@@ -110,7 +120,7 @@ static void oledBoot() {
   display.display();
 }
 
-// ---------- HTTP: stream handler (port 81) ----------
+// ---------- HTTP: stream handler ----------
 static esp_err_t stream_handler(httpd_req_t *req) {
   camera_fb_t * fb = NULL;
   esp_err_t res = ESP_OK;
@@ -154,7 +164,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
   return res;
 }
 
-// ---------- HTTP: command handler (port 80) ----------
+// ---------- HTTP: command handler ----------
 static esp_err_t cmd_handler(httpd_req_t *req) {
   char*  buf;
   size_t buf_len;
@@ -185,9 +195,18 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   return httpd_resp_sendstr(req, "OK");
 }
 
-// ---------- HTTP: index page (port 80) ----------
+// ---------- HTTP: captive-portal redirect ----------
+static esp_err_t captive_handler(httpd_req_t *req) {
+  httpd_resp_set_status(req, "302 Found");
+  httpd_resp_set_hdr(req, "Location", "/");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+  httpd_resp_send(req, "", 0);
+  return ESP_OK;
+}
+
+// ---------- HTTP: index page ----------
 static esp_err_t index_handler(httpd_req_t *req) {
-static const char PROGMEM INDEX_HTML[] = R"HTML(
+  static const char PROGMEM INDEX_HTML[] = R"HTML(
 <!doctype html><html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -203,17 +222,10 @@ static const char PROGMEM INDEX_HTML[] = R"HTML(
   .left, .right{display:flex;gap:.5rem;align-items:center}
   button,select{font-size:16px;padding:.45rem .7rem;background:#111;color:#fff;border:1px solid #333;border-radius:.5rem}
   #stage{
-    position:fixed;inset:0; /* full viewport */
-    display:flex;align-items:center;justify-content:center;
+    position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
   }
-  /* Make the MJPEG fill the screen while preserving aspect */
   #stream{
-    display:block;
-    width:100vw;          /* fill width */
-    height:100vh;         /* fill height */
-    object-fit:contain;   /* or 'cover' if you want edge-to-edge crop */
-    background:#000;
-    touch-action:none;
+    display:block;width:100vw;height:100vh;object-fit:contain;background:#000;touch-action:none;
   }
 </style>
 </head><body>
@@ -247,11 +259,7 @@ static const char PROGMEM INDEX_HTML[] = R"HTML(
 
 <script>
   const img = document.getElementById('stream');
-
-  // If your stream runs on PORT 80 use this:
-  const streamURL = 'http://' + location.hostname + ':/stream';
-  // If you moved the stream to the same server on port 80, use:
-  // const streamURL = '/stream';
+  const streamURL = '/stream';       // same server/port
 
   const start = () => { img.src = streamURL; };
   const stop  = () => { img.src = ''; };
@@ -264,7 +272,6 @@ static const char PROGMEM INDEX_HTML[] = R"HTML(
   document.getElementById('quality').onchange   = (e) =>
     fetch(`/control?var=quality&val=${e.target.value}`).catch(()=>{});
 
-  // Fullscreen helpers
   const toFS = () => {
     const el = document.documentElement;
     if (document.fullscreenElement) return document.exitFullscreen();
@@ -272,14 +279,9 @@ static const char PROGMEM INDEX_HTML[] = R"HTML(
   };
   document.getElementById('fs').onclick = toFS;
 
-  // Auto-start stream after page loads
   window.addEventListener('load', () => start(), { once:true });
-
-  // Handle orientation changes (image already scales via CSS)
   window.addEventListener('orientationchange', () => {
-    // nudge reflow on mobile
-    img.style.transform='translateZ(0)';
-    setTimeout(()=>img.style.transform='',100);
+    img.style.transform='translateZ(0)'; setTimeout(()=>img.style.transform='',100);
   });
 </script>
 </body></html>
@@ -289,7 +291,7 @@ static const char PROGMEM INDEX_HTML[] = R"HTML(
   return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
 }
 
-// ---------- Start servers ----------
+// ---------- Start server (all on port 80) ----------
 static void startCameraServer(){
   httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
   cfg.server_port = 80;
@@ -299,13 +301,27 @@ static void startCameraServer(){
   httpd_uri_t cmd_uri    = { .uri="/control", .method=HTTP_GET, .handler=cmd_handler,   .user_ctx=NULL };
   httpd_uri_t stream_uri = { .uri="/stream",  .method=HTTP_GET, .handler=stream_handler,.user_ctx=NULL };
 
+  // captive-portal probes (redirect to "/")
+  httpd_uri_t cp_g204  = { .uri="/generate_204",        .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
+  httpd_uri_t cp_hotsp = { .uri="/hotspot-detect.html", .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
+  httpd_uri_t cp_ms    = { .uri="/ncsi.txt",            .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
+  httpd_uri_t cp_ms2   = { .uri="/connecttest.txt",     .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
+  httpd_uri_t cp_fw    = { .uri="/fwlink",              .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
+  httpd_uri_t cp_wpad  = { .uri="/wpad.dat",            .method=HTTP_GET, .handler=captive_handler, .user_ctx=NULL };
+
   if (httpd_start(&httpd_ctrl, &cfg) == ESP_OK) {
     httpd_register_uri_handler(httpd_ctrl, &index_uri);
     httpd_register_uri_handler(httpd_ctrl, &cmd_uri);
     httpd_register_uri_handler(httpd_ctrl, &stream_uri);
+
+    httpd_register_uri_handler(httpd_ctrl, &cp_g204);
+    httpd_register_uri_handler(httpd_ctrl, &cp_hotsp);
+    httpd_register_uri_handler(httpd_ctrl, &cp_ms);
+    httpd_register_uri_handler(httpd_ctrl, &cp_ms2);
+    httpd_register_uri_handler(httpd_ctrl, &cp_fw);
+    httpd_register_uri_handler(httpd_ctrl, &cp_wpad);
   }
 }
-
 
 // ---------- Setup ----------
 void setup() {
@@ -317,6 +333,10 @@ void setup() {
 
   oledBoot();
   oledPrintCentered("Booting...", "");
+
+  // Ensure sensor is powered up (PWDN LOW)
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, LOW);
 
   // Camera config
   camera_config_t config;
@@ -338,41 +358,43 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 16500000;             // gentler than 20 MHz
+  config.xclk_freq_hz = 16500000;          // gentler than 20 MHz
   config.pixel_format = PIXFORMAT_JPEG;
 
   if (psramFound()) {
-    config.frame_size   = STREAM_SIZE;        // e.g., FRAMESIZE_VGA
-    config.jpeg_quality = JPEG_QUALITY;       // 10..20 (lower = better)
+    config.frame_size   = STREAM_SIZE;     // e.g., FRAMESIZE_VGA
+    config.jpeg_quality = JPEG_QUALITY;    // 10..20 (lower = better)
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
   } else {
-    config.frame_size   = FRAMESIZE_QVGA;     // start small (320x240)
-    config.jpeg_quality = 20;                 // a bit higher quality number = smaller frames
-    config.fb_count     = 1;                  // only 1 buffer
-    config.fb_location  = CAMERA_FB_IN_DRAM;  // <-- important without PSRAM
+    config.frame_size   = FRAMESIZE_QVGA;  // start small (320x240)
+    config.jpeg_quality = 20;              // higher number -> smaller frames
+    config.fb_count     = 1;
+    config.fb_location  = CAMERA_FB_IN_DRAM;
   }
 
   esp_err_t err = esp_camera_init(&config);
-  sensor_t* s = esp_camera_sensor_get();
-  s->set_framesize(s, STREAM_SIZE);
-  s->set_quality(s, JPEG_QUALITY);
-
-  /* DEBUG: show sensor-generated color bars */
-  s->set_colorbar(s, 1);
-
   if (err != ESP_OK) {
     Serial.printf("Camera init failed: 0x%x\n", err);
     oledPrintCentered("Camera init", "FAILED");
     delay(2000);
   } else {
-    // set initial params
     sensor_t* s = esp_camera_sensor_get();
     Serial.printf("Sensor PID=0x%02X, VER=0x%02X, MIDL=0x%02X, MIDH=0x%02X\n",
       s->id.PID, s->id.VER, s->id.MIDL, s->id.MIDH);
 
     s->set_framesize(s, STREAM_SIZE);
     s->set_quality(s, JPEG_QUALITY);
+
+    // DEBUG: enable once to verify capture, then set back to 0
+    if (s->set_colorbar) s->set_colorbar(s, 0);
+
+    // Nice defaults
+    if (s->set_gain_ctrl)     s->set_gain_ctrl(s, 1);
+    if (s->set_exposure_ctrl) s->set_exposure_ctrl(s, 1);
+    if (s->set_whitebal)      s->set_whitebal(s, 1);
+    if (s->set_awb_gain)      s->set_awb_gain(s, 1);
+
     oledPrintCentered("Camera", "OK");
     delay(400);
   }
@@ -386,14 +408,29 @@ void setup() {
   Serial.print("SSID: "); Serial.println(AP_SSID);
   Serial.print("IP:   "); Serial.println(ip);
 
-  String ipStr = String(ip[0]) + "." + ip[1] + "." + ip[2] + "." + ip[3];
+  // DNS wildcard -> resolve all names to us (captive-portal style)
+  dnsServer.start(DNS_PORT, "*", ip);
+  Serial.println("DNS server started (wildcard): http://nozzlecam/");
+
+  // mDNS responder -> nozzcam.local
+  if (MDNS.begin("nozzcam")) {
+    Serial.println("mDNS: http://nozzcam.local");
+  } else {
+    Serial.println("mDNS setup failed");
+  }
+
+  String ipStr = ip.toString();
   oledPrintCentered(AP_SSID, ipStr);
 
   startCameraServer();
   Serial.println("UI:     http://192.168.4.1");
   Serial.println("Stream: http://192.168.4.1/stream");
+  Serial.println("Also try: http://nozzlecam/  or  http://nozzcam.local/");
 }
 
 void loop() {
-  // nothing — HTTP servers + camera run in background tasks
+  // Keep DNS server responsive
+  dnsServer.processNextRequest();
+
+  // webserver & stream run in background tasks
 }
