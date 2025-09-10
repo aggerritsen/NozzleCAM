@@ -167,9 +167,29 @@ static esp_err_t index_handler(httpd_req_t *req) {
     padding:.5rem .75rem;background:rgba(0,0,0,.4);backdrop-filter:blur(6px)
   }
   .left, .right{display:flex;gap:.5rem;align-items:center}
-  button{
-    font-size:16px;padding:.45rem .7rem;background:#111;color:#fff;border:1px solid #333;border-radius:.5rem
+
+  /* Icon buttons */
+  button.icon{
+    width:42px;height:42px;padding:0;display:inline-block;
+    border:1px solid #333;border-radius:.6rem;background:#111 center/24px 24px no-repeat;
+    cursor:pointer;outline:none
   }
+  button.icon:focus-visible{box-shadow:0 0 0 2px #09f6}
+  button.icon:hover{background-color:#141414}
+  button.icon:active{transform:translateY(1px)}
+  button.icon.toggle.on{box-shadow:inset 0 0 0 2px #0af}
+  /* Assign icon images via CSS vars (self-contained SVG data URIs) */
+  button.icon{background-image:var(--img)}
+  /* Camera (Snapshot) */
+  #shot{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%23fff' d='M9 4l1.5 2H18a2 2 0 012 2v8a2 2 0 01-2 2H6a2 2 0 01-2-2V8a2 2 0 012-2h2.5L9 4zm3 4a5 5 0 100 10 5 5 0 000-10zm0 2a3 3 0 110 6 3 3 0 010-6z'/></svg>")}
+  /* Record (red circle) / Stop (red square) */
+  #rec{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='6' fill='%23e53935'/></svg>")}
+  #rec.on{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='7' y='7' width='10' height='10' rx='2' fill='%23e53935'/></svg>")}
+  /* Fullscreen enter / exit */
+  #fs{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%23fff' d='M4 9V4h5v2H6v3H4zm10-5h5v5h-2V6h-3V4zM4 15h2v3h3v2H4v-5zm13 3v-3h2v5h-5v-2h3z'/></svg>")}
+  #fs.on{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%23fff' d='M9 7V4H4v5h2V7h3zm9 2h2V4h-5v3h3v2zM7 15H4v5h5v-2H7v-3zm10 3h-3v2h5v-5h-2v3z'/></svg>")}
+
+  #dl{ display:none } /* fallback link hidden until needed */
   #stage{
     position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
   }
@@ -182,9 +202,10 @@ static esp_err_t index_handler(httpd_req_t *req) {
   <div class="bar">
     <div class="left"><strong>NozzleCAM</strong></div>
     <div class="right">
-      <button id="shot">Snapshot</button>
-      <button id="rec">Record</button>
-      <button id="fs">Fullscreen</button>
+      <a id="dl" class="btn" download>Save file…</a>
+      <button id="shot" class="icon" aria-label="Snapshot" title="Snapshot"></button>
+      <button id="rec" class="icon toggle" aria-label="Record" title="Record" aria-pressed="false"></button>
+      <button id="fs"  class="icon toggle" aria-label="Fullscreen" title="Fullscreen" aria-pressed="false"></button>
     </div>
   </div>
 
@@ -194,76 +215,116 @@ static esp_err_t index_handler(httpd_req_t *req) {
   </div>
 
 <script>
-  const img = document.getElementById('stream');
-  const cvs = document.getElementById('cvs');
-  const ctx = cvs.getContext('2d');
+  const img  = document.getElementById('stream');
+  const cvs  = document.getElementById('cvs');
+  const ctx  = cvs.getContext('2d');
+  const dl   = document.getElementById('dl');
+  const btnShot = document.getElementById('shot');
+  const btnRec  = document.getElementById('rec');
+  const btnFS   = document.getElementById('fs');
 
   // Always start the MJPEG stream immediately
   const streamURL = '/stream';
   img.src = streamURL;
 
-  // Fullscreen
-  document.getElementById('fs').onclick = () => {
+  // --- Fullscreen ---
+  function syncFSButton(){
+    const on = !!document.fullscreenElement;
+    btnFS.classList.toggle('on', on);
+    btnFS.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+  btnFS.onclick = () => {
     const el = document.documentElement;
     if (document.fullscreenElement) document.exitFullscreen();
     else if (el.requestFullscreen) el.requestFullscreen();
   };
+  document.addEventListener('fullscreenchange', syncFSButton);
 
   // Helper: set canvas to current image dimensions
   function syncCanvasToImage(){
     const w = img.naturalWidth || img.videoWidth || img.width;
     const h = img.naturalHeight || img.videoHeight || img.height;
-    if (w && h && (cvs.width !== w || cvs.height !== h)) {
-      cvs.width = w; cvs.height = h;
-    }
+    if (w && h && (cvs.width !== w || cvs.height !== h)) { cvs.width = w; cvs.height = h; }
   }
 
-  // Snapshot (client-side): draw current frame to canvas and download JPEG
-  document.getElementById('shot').onclick = async () => {
+  // ---- SMART SAVE FALLBACKS (for DuckDuckGo etc.) ----
+  let lastURL = null;
+  function showFallbackLink(url, filename){
+    // keep previous blob alive until replaced
+    if (lastURL && lastURL !== url) { try { URL.revokeObjectURL(lastURL); } catch(e){} }
+    lastURL = url;
+    dl.href = url;
+    dl.download = filename;
+    dl.style.display = 'inline-block';
+    showMsg('Tap "Save file…" to store locally');
+  }
+
+  async function saveBlobSmart(blob, filename, mime){
+    // 1) Try Web Share (mobile-friendly)
+    const file = new File([blob], filename, { type: mime });
+    try {
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'NozzleCAM' });
+        showMsg('Shared');
+        return;
+      }
+    } catch(e) {
+      // user canceled or share failed; continue
+    }
+
+    // 2) Try classic download click
+    const url = URL.createObjectURL(blob);
+    try {
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a);
+      a.click(); // may be blocked in privacy browsers
+      a.remove();
+      showMsg('Saved to Downloads');
+      // schedule revoke; not immediate to allow download to start
+      setTimeout(()=>URL.revokeObjectURL(url), 3000);
+    } catch(e) {
+      // 3) Show visible fallback link the user can tap
+      showFallbackLink(url, filename);
+    }
+  }
+  // ----------------------------------------------------
+
+  // Snapshot (image-only button)
+  btnShot.onclick = async () => {
     try{
       syncCanvasToImage();
-      if (!cvs.width || !cvs.height) { alert('No frame yet.'); return; }
+      if (!cvs.width || !cvs.height) { showMsg('No frame yet'); return; }
       ctx.drawImage(img, 0, 0, cvs.width, cvs.height);
-      cvs.toBlob((blob)=>{
-        if (!blob) return;
-        const a = document.createElement('a');
-        a.href = URL.createObjectURL(blob);
+      cvs.toBlob(async (blob)=>{
+        if (!blob) { showMsg('Snapshot failed'); return; }
         const ts = new Date().toISOString().replace(/[:.]/g,'-');
-        a.download = `NozzleCAM_${ts}.jpg`;
-        document.body.appendChild(a);
-        a.click();
-        showMsg("Snapshot saved");
-        setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 500);
+        await saveBlobSmart(blob, `NozzleCAM_${ts}.jpg`, 'image/jpeg');
       }, 'image/jpeg', 0.95);
-    }catch(e){
-      showMsg("Snapshot failed"); 
-      console.error(e); 
-    }
+    }catch(e){ showMsg('Snapshot failed'); console.error(e); }
   };
 
   // Recording (client-side): draw frames to canvas at ~20 fps, record canvas stream
   let rec = null, chunks = [], drawTimer = null;
-  document.getElementById('rec').onclick = () => {
+  function setRecUI(on){
+    btnRec.classList.toggle('on', on);
+    btnRec.setAttribute('aria-pressed', on ? 'true' : 'false');
+  }
+  btnRec.onclick = () => {
     if (rec && rec.state !== 'inactive') {
-      // Stop recording
       clearInterval(drawTimer); drawTimer = null;
       rec.stop();
       return;
     }
-    if (typeof MediaRecorder === 'undefined') {
-      alert('Recording not supported by this browser. Snapshot still works.');
-      showMsg("Recording not supported");
-      return;
-    }
-    syncCanvasToImage();
-    if (!cvs.width || !cvs.height) { alert('No frame yet.'); return; }
+    if (typeof MediaRecorder === 'undefined') { showMsg('Recording not supported'); return; }
 
-    // draw loop: copy IMG → canvas periodically
+    syncCanvasToImage();
+    if (!cvs.width || !cvs.height) { showMsg('No frame yet'); return; }
+
     const fps = 20;
     drawTimer = setInterval(()=>{
       try{
         if (!img.complete) return;
-        // if resolution changes mid-stream, resync canvas
         if (img.naturalWidth && (img.naturalWidth !== cvs.width || img.naturalHeight !== cvs.height)) {
           cvs.width = img.naturalWidth; cvs.height = img.naturalHeight;
         }
@@ -280,31 +341,29 @@ static esp_err_t index_handler(httpd_req_t *req) {
     try {
       rec = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: 5_000_000});
     } catch(e) {
-      alert('This browser does not support WebM recording.'); clearInterval(drawTimer); return;
+      showMsg('Recording not supported'); clearInterval(drawTimer); return;
     }
 
     rec.ondataavailable = (ev)=>{ if (ev.data && ev.data.size) chunks.push(ev.data); };
-    rec.onstop = ()=>{
-      const blob = new Blob(chunks, {type: chunks[0]?.type || 'video/webm'});
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
+    rec.onstop = async ()=>{
+      const type = chunks[0]?.type || 'video/webm';
+      const blob = new Blob(chunks, { type });
       const ts = new Date().toISOString().replace(/[:.]/g,'-');
-      a.download = `NozzleCAM_${ts}.webm`;
-      document.body.appendChild(a);
-      a.click();
-      showMsg("Video saved");
-      setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1500);
-      document.getElementById('rec').textContent = 'Record';
+      await saveBlobSmart(blob, `NozzleCAM_${ts}.webm`, type);
+      setRecUI(false);
     };
 
-    rec.start(1000); // collect in 1s chunks
-    document.getElementById('rec').textContent = 'Stop';
+    rec.start(1000);
+    setRecUI(true);
   };
 
   // Nudge reflow on orientation change (image scales via CSS)
   window.addEventListener('orientationchange', () => {
     img.style.transform='translateZ(0)'; setTimeout(()=>img.style.transform='',100);
   });
+
+  // Initialize FS button on load
+  syncFSButton();
 </script>
 
 <!-- Toast message container -->
