@@ -1,5 +1,6 @@
 /**
  * TTGO T-Journal (ESP32 + OV2640 + OLED 0.91" SSD1306 128x32)
+ * Prooven version
  * - Wi-Fi Access Point with browser UI at http://192.168.4.1
  * - Live MJPEG stream at  /stream   (same server/port)
  * - OLED shows SSID / IP / status
