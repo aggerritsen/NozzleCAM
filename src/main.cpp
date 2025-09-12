@@ -58,11 +58,11 @@ static const int   AP_CHANNEL  = 6;
 // Optional IR-cut control on some variants:
 // #define IRCUT_GPIO_NUM  16
 
-// Conservative defaults to bring up a wedged module:
-static framesize_t STREAM_SIZE = FRAMESIZE_QVGA;   // 320x240 to start
-static int         JPEG_QUALITY = 12;              // 10..15 good
-static int         FB_COUNT = 1;                   // single FB = simplest
-static int         XCLK_HZ  = 24000000;            // OV2640 is happy at 24MHz
+// Conservative bring-up (replace with these)
+static framesize_t STREAM_SIZE = FRAMESIZE_XGA;   // was QVGA
+static int         JPEG_QUALITY = 16;              // 10..16 (lower = better quality)
+static int         FB_COUNT = 2;                   // use 2 with PSRAM
+static int         XCLK_HZ  = 24000000;            // OV2640 sweet spot
 
 // ---------- Web ----------
 WebServer server(80);
