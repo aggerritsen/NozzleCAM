@@ -1,436 +1,225 @@
 /**
- * TTGO T-Journal (ESP32 + OV2640 + OLED 0.91" SSD1306 128x32)
- * Prooven version
- * - Wi-Fi Access Point with browser UI at http://192.168.4.1
- * - Live MJPEG stream at  /stream   (same server/port)
- * - OLED shows SSID / IP / status
- * - DNS wildcard -> http://nozzlecam/
- * - mDNS responder -> http://nozzcam.local/
+ * NOTE: Build can include -D CONFIG_LWIP_TCP_OVERSIZE_MSS=1 per your toolchain.
+ * T-Camera Plus S3 (ESP32-S3) + OV2640 — Stable WebServer (Arduino)
+ * Fixes:
+ * - Use XCLK=20 MHz (OV2640-friendly)
+ * - Use FB_COUNT=2 in PSRAM for continuous streaming
+ * - Explicitly apply framesize & JPEG quality to sensor_t after init
+ * - Optional grab_mode = CAMERA_GRAB_LATEST (if available)
+ * - Warm-up: grab & discard a few frames in setup
+ * - Stream handler retries a few times if first fb is NULL
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include "esp_camera.h"
 #include "esp_timer.h"
 #include "img_converters.h"
-#include "fb_gfx.h"
-#include "esp_http_server.h"
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
+#include "nvs_flash.h"
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+#include "esp_chip_info.h"
 
-// DNS & mDNS
-#include <DNSServer.h>
-#include <ESPmDNS.h>
+// ---- Simple logging macros (Serial-based) ----
+#define LOGI(tag, fmt, ...) Serial.printf("[I] %s: " fmt "\n", tag, ##__VA_ARGS__)
+#define LOGW(tag, fmt, ...) Serial.printf("[W] %s: " fmt "\n", tag, ##__VA_ARGS__)
+#define LOGE(tag, fmt, ...) Serial.printf("[E] %s: " fmt "\n", tag, ##__VA_ARGS__)
+#define LOGD(tag, fmt, ...) Serial.printf("[D] %s: " fmt "\n", tag, ##__VA_ARGS__)
+static const char* TAG = "TCAMERADBG";
 
-// OLED
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-
-// ======= AP CONFIG =======
-static const char* AP_SSID     = "NozzleCAM";
-static const char* AP_PASSWORD = "";   // empty -> open network
+// ===== Wi-Fi AP =====
+static const char* AP_SSID     = "T-CameraPlus";
+static const char* AP_PASSWORD = "";      // empty = open network
 static const int   AP_CHANNEL  = 6;
 static const bool  AP_HIDDEN   = false;
 
-// ======= OLED CONFIG =======
-#ifndef I2C_SDA
-#define I2C_SDA 14
-#endif
-#ifndef I2C_SCL
-#define I2C_SCL 13
-#endif
-#define OLED_WIDTH   128
-#define OLED_HEIGHT   32
-#define OLED_ADDR   0x3C
+// ===== Stream quality (OV2640-safe) =====
+framesize_t STREAM_SIZE = FRAMESIZE_VGA;   // start at 640x480; raise to SVGA later
+int JPEG_QUALITY        = 12;              // lower = better quality (bigger); 10–15 good
+int FB_COUNT            = 2;               // use 2 FBs if PSRAM (smoother streaming)
 
-// ======= STREAM DEFAULTS (max-ish quality) =======
-framesize_t STREAM_SIZE = FRAMESIZE_UXGA; // 1600x1200 (needs PSRAM)
-int JPEG_QUALITY = 10;                    // lower = better image, bigger size
-int FB_COUNT     = 2;                     // 2 with PSRAM, else 1
+// ===== Camera pins: T-Camera Plus S3 DVP mapping =====
+#define PWDN_GPIO_NUM    -1
+#define RESET_GPIO_NUM   -1
+#define XCLK_GPIO_NUM     7
+#define SIOD_GPIO_NUM     1
+#define SIOC_GPIO_NUM     2
+#define Y9_GPIO_NUM       6   // D7
+#define Y8_GPIO_NUM       8   // D6
+#define Y7_GPIO_NUM       9   // D5
+#define Y6_GPIO_NUM      11   // D4
+#define Y5_GPIO_NUM      13   // D3
+#define Y4_GPIO_NUM      15   // D2
+#define Y3_GPIO_NUM      14   // D1
+#define Y2_GPIO_NUM      12   // D0
+#define VSYNC_GPIO_NUM    3
+#define HREF_GPIO_NUM     5
+#define PCLK_GPIO_NUM    10
+// Optional IR-cut:
+// #define IRCUT_GPIO_NUM  16
 
-// ======= CAMERA PINS: TTGO T-JOURNAL =======
-#define PWDN_GPIO_NUM  32
-#define RESET_GPIO_NUM 15
-#define XCLK_GPIO_NUM  27
-#define SIOD_GPIO_NUM  25
-#define SIOC_GPIO_NUM  23
-#define Y9_GPIO_NUM    19
-#define Y8_GPIO_NUM    36
-#define Y7_GPIO_NUM    18
-#define Y6_GPIO_NUM    39
-#define Y5_GPIO_NUM     5
-#define Y4_GPIO_NUM    34
-#define Y3_GPIO_NUM    35
-#define Y2_GPIO_NUM    17
-#define VSYNC_GPIO_NUM 22
-#define HREF_GPIO_NUM  26
-#define PCLK_GPIO_NUM  21
+// ===== Web server (Arduino) =====
+WebServer server(80);
 
-// ======= GLOBALS =======
-httpd_handle_t httpd_ctrl = NULL; // single server on port 80
-Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
-DNSServer dnsServer;
-const byte DNS_PORT = 53;
-
-// ---------- OLED helpers ----------
-static void oledPrintCentered(const String& line1, const String& line2 = "") {
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-
-  int16_t x1, y1; uint16_t w, h;
-  display.getTextBounds(line1, 0, 0, &x1, &y1, &w, &h);
-  int16_t x = (OLED_WIDTH - w) / 2;
-  int16_t y = 2;
-  display.setCursor(x, y);
-  display.print(line1);
-
-  if (line2.length()) {
-    display.getTextBounds(line2, 0, 0, &x1, &y1, &w, &h);
-    x = (OLED_WIDTH - w) / 2;
-    y = 18;
-    display.setCursor(x, y);
-    display.print(line2);
+static const char* framesizeName(framesize_t fs) {
+  switch(fs){
+    case FRAMESIZE_QQVGA: return "QQVGA(160x120)";
+    case FRAMESIZE_QCIF:  return "QCIF(176x144)";
+    case FRAMESIZE_HQVGA: return "HQVGA(240x176)";
+    case FRAMESIZE_QVGA:  return "QVGA(320x240)";
+    case FRAMESIZE_CIF:   return "CIF(352x288)";
+    case FRAMESIZE_VGA:   return "VGA(640x480)";
+    case FRAMESIZE_SVGA:  return "SVGA(800x600)";
+    case FRAMESIZE_XGA:   return "XGA(1024x768)";
+    case FRAMESIZE_SXGA:  return "SXGA(1280x1024)";
+    case FRAMESIZE_UXGA:  return "UXGA(1600x1200)";
+    case FRAMESIZE_HD:    return "HD(1280x720)";
+    case FRAMESIZE_FHD:   return "FHD(1920x1080)";
+    case FRAMESIZE_QXGA:  return "QXGA(2048x1536)";
+    case FRAMESIZE_QHD:   return "QHD(2560x1440)";
+    case FRAMESIZE_WQXGA: return "WQXGA(2560x1600)";
+    default: return "INVALID";
   }
-  display.display();
 }
 
-static void oledBoot() {
-  Wire.begin(I2C_SDA, I2C_SCL);
-  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) return;
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println(F("TTGO T-Journal"));
-  display.println(F("AP Camera Stream"));
-  display.display();
+static void printChipInfo() {
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+  LOGI(TAG, "Chip: model=%d cores=%d features=0x%x rev=%d",
+      chip.model, chip.cores, chip.features, chip.revision);
+  LOGI(TAG, "IDF version: %s", esp_get_idf_version());
 }
 
-// ---------- HTTP: stream handler ----------
-static esp_err_t stream_handler(httpd_req_t *req) {
-  camera_fb_t * fb = NULL;
-  esp_err_t res = ESP_OK;
-  size_t _jpg_buf_len = 0;
-  uint8_t * _jpg_buf = NULL;
-  char part_buf[64];
-
-  res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
-  if(res != ESP_OK) return res;
-
-  while (true) {
-    fb = esp_camera_fb_get();
-    if (!fb) { httpd_resp_send_500(req); break; }
-
-    if (fb->format != PIXFORMAT_JPEG) {
-      bool ok = frame2jpg(fb, JPEG_QUALITY, &_jpg_buf, &_jpg_buf_len);
-      esp_camera_fb_return(fb); fb = NULL;
-      if (!ok) { httpd_resp_send_500(req); break; }
-    } else {
-      _jpg_buf = fb->buf;
-      _jpg_buf_len = fb->len;
-    }
-
-    size_t hlen = (size_t)snprintf(part_buf, sizeof(part_buf),
-      "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-      (unsigned)_jpg_buf_len);
-
-    if (httpd_resp_send_chunk(req, part_buf, hlen) != ESP_OK ||
-        httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len) != ESP_OK ||
-        httpd_resp_send_chunk(req, "\r\n", 2) != ESP_OK) {
-      if (fb) esp_camera_fb_return(fb);
-      else if (_jpg_buf) free(_jpg_buf);
-      break;
-    }
-
-    if (fb) { esp_camera_fb_return(fb); fb = NULL; _jpg_buf = NULL; }
-    else if (_jpg_buf) { free(_jpg_buf); _jpg_buf = NULL; }
-
-    vTaskDelay(1);
-  }
-  return res;
+static void printHeapInfo(const char* label) {
+  size_t free_int = heap_caps_get_free_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+  size_t free_ps  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  size_t tot_int  = heap_caps_get_total_size(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+  size_t tot_ps   = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+  LOGI(TAG, "[%s] Heap INT: %u/%u  PSRAM: %u/%u",
+      label, (unsigned)free_int, (unsigned)tot_int, (unsigned)free_ps, (unsigned)tot_ps);
 }
 
-// ---------- HTTP: index page ----------
-static esp_err_t index_handler(httpd_req_t *req) {
+// ---------- Handlers ----------
+static void handleIndex() {
   static const char PROGMEM INDEX_HTML[] = R"HTML(
 <!doctype html><html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>NozzleCAM</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>T-Camera Plus S3</title>
 <style>
-  :root,html,body{height:100%;margin:0}
-  body{background:#000;color:#fff;font-family:system-ui,Arial,sans-serif}
-  .bar{
-    position:fixed;left:0;right:0;top:0;z-index:10;
-    display:flex;gap:.5rem;align-items:center;justify-content:space-between;
-    padding:.5rem .75rem;background:rgba(0,0,0,.4);backdrop-filter:blur(6px)
-  }
-  .left, .right{display:flex;gap:.5rem;align-items:center}
+:root,html,body{height:100%;margin:0}body{background:#000;color:#fff;font-family:system-ui,Arial,sans-serif}
+.bar{position:fixed;left:0;right:0;top:0;z-index:10;display:flex;gap:.5rem;align-items:center;justify-content:space-between;
+padding:.5rem .75rem;background:rgba(0,0,0,.4);backdrop-filter:blur(6px)}
+#stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
+#stream{display:block;width:100vw;height:100vh;object-fit:contain;background:#000}
+small{opacity:.7}
+</style></head><body>
+  <div class="bar"><div><strong>T-Camera Plus S3</strong></div><div><small>MJPEG at <code>/stream</code></small></div></div>
+  <div id="stage"><img id="stream" src="/stream" alt="Live stream"></div>
+</body></html>)HTML";
 
-  /* Icon buttons */
-  button.icon{
-    width:42px;height:42px;padding:0;display:inline-block;
-    border:1px solid #333;border-radius:.6rem;background:#111 center/24px 24px no-repeat;
-    cursor:pointer;outline:none
-  }
-  button.icon:focus-visible{box-shadow:0 0 0 2px #09f6}
-  button.icon:hover{background-color:#141414}
-  button.icon:active{transform:translateY(1px)}
-  button.icon.toggle.on{box-shadow:inset 0 0 0 2px #0af}
-  /* Assign icon images via CSS vars (self-contained SVG data URIs) */
-  button.icon{background-image:var(--img)}
-  /* Camera (Snapshot) */
-  #shot{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%23fff' d='M9 4l1.5 2H18a2 2 0 012 2v8a2 2 0 01-2 2H6a2 2 0 01-2-2V8a2 2 0 012-2h2.5L9 4zm3 4a5 5 0 100 10 5 5 0 000-10zm0 2a3 3 0 110 6 3 3 0 010-6z'/></svg>")}
-  /* Record (red circle) / Stop (red square) */
-  #rec{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='6' fill='%23e53935'/></svg>")}
-  #rec.on{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='7' y='7' width='10' height='10' rx='2' fill='%23e53935'/></svg>")}
-  /* Fullscreen enter / exit */
-  #fs{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%23fff' d='M4 9V4h5v2H6v3H4zm10-5h5v5h-2V6h-3V4zM4 15h2v3h3v2H4v-5zm13 3v-3h2v5h-5v-2h3z'/></svg>")}
-  #fs.on{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%23fff' d='M9 7V4H4v5h2V7h3zm9 2h2V4h-5v3h3v2zM7 15H4v5h5v-2H7v-3zm10 3h-3v2h5v-5h-2v3z'/></svg>")}
+  server.setContentLength(strlen(INDEX_HTML));
+  server.send(200, "text/html", INDEX_HTML);
+}
 
-  #dl{ display:none } /* fallback link hidden until needed */
-  #stage{
-    position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
-  }
-  #stream{
-    display:block;width:100vw;height:100vh;object-fit:contain;background:#000;touch-action:none;
-  }
-  canvas{display:none}
-</style>
-</head><body>
-  <div class="bar">
-    <div class="left"><strong>NozzleCAM</strong></div>
-    <div class="right">
-      <a id="dl" class="btn" download>Save file…</a>
-      <button id="shot" class="icon" aria-label="Snapshot" title="Snapshot"></button>
-      <button id="rec" class="icon toggle" aria-label="Record" title="Record" aria-pressed="false"></button>
-      <button id="fs"  class="icon toggle" aria-label="Fullscreen" title="Fullscreen" aria-pressed="false"></button>
-    </div>
-  </div>
+static void handleStream() {
+  LOGI(TAG, "Client connected to /stream");
+  WiFiClient client = server.client();
+  if (!client) { LOGE(TAG, "No client?"); return; }
 
-  <div id="stage">
-    <img id="stream" alt="Live stream">
-    <canvas id="cvs"></canvas>
-  </div>
+  // Multipart header
+  String hdr =
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+    "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+    "Pragma: no-cache\r\n"
+    "Connection: close\r\n\r\n";
+  client.print(hdr);
 
-<script>
-  const img  = document.getElementById('stream');
-  const cvs  = document.getElementById('cvs');
-  const ctx  = cvs.getContext('2d');
-  const dl   = document.getElementById('dl');
-  const btnShot = document.getElementById('shot');
-  const btnRec  = document.getElementById('rec');
-  const btnFS   = document.getElementById('fs');
+  uint32_t frames = 0;
+  uint64_t t0 = esp_timer_get_time();
+  uint8_t consecutive_null = 0;
 
-  // Always start the MJPEG stream immediately
-  const streamURL = '/stream';
-  img.src = streamURL;
-
-  // --- Fullscreen ---
-  function syncFSButton(){
-    const on = !!document.fullscreenElement;
-    btnFS.classList.toggle('on', on);
-    btnFS.setAttribute('aria-pressed', on ? 'true' : 'false');
-  }
-  btnFS.onclick = () => {
-    const el = document.documentElement;
-    if (document.fullscreenElement) document.exitFullscreen();
-    else if (el.requestFullscreen) el.requestFullscreen();
-  };
-  document.addEventListener('fullscreenchange', syncFSButton);
-
-  // Helper: set canvas to current image dimensions
-  function syncCanvasToImage(){
-    const w = img.naturalWidth || img.videoWidth || img.width;
-    const h = img.naturalHeight || img.videoHeight || img.height;
-    if (w && h && (cvs.width !== w || cvs.height !== h)) { cvs.width = w; cvs.height = h; }
-  }
-
-  // ---- SMART SAVE FALLBACKS (for DuckDuckGo etc.) ----
-  let lastURL = null;
-  function showFallbackLink(url, filename){
-    // keep previous blob alive until replaced
-    if (lastURL && lastURL !== url) { try { URL.revokeObjectURL(lastURL); } catch(e){} }
-    lastURL = url;
-    dl.href = url;
-    dl.download = filename;
-    dl.style.display = 'inline-block';
-    showMsg('Tap "Save file…" to store locally');
-  }
-
-  async function saveBlobSmart(blob, filename, mime){
-    // 1) Try Web Share (mobile-friendly)
-    const file = new File([blob], filename, { type: mime });
-    try {
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: 'NozzleCAM' });
-        showMsg('Shared');
-        return;
+  while (client.connected()) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (!fb) {
+      consecutive_null++;
+      LOGW(TAG, "fb_get NULL (%u)", consecutive_null);
+      if (consecutive_null >= 5) {
+        LOGE(TAG, "Too many NULL frames; abort stream");
+        break;
       }
-    } catch(e) {
-      // user canceled or share failed; continue
+      delay(10);
+      continue;
+    }
+    consecutive_null = 0;
+
+    uint8_t * jpg_buf = nullptr;
+    size_t jpg_len = 0;
+
+    if (fb->format != PIXFORMAT_JPEG) {
+      bool ok = frame2jpg(fb, JPEG_QUALITY, &jpg_buf, &jpg_len);
+      esp_camera_fb_return(fb); fb = nullptr;
+      if (!ok) { LOGE(TAG, "frame2jpg() failed"); break; }
+    } else {
+      jpg_buf = fb->buf; jpg_len = fb->len;
     }
 
-    // 2) Try classic download click
-    const url = URL.createObjectURL(blob);
-    try {
-      const a = document.createElement('a');
-      a.href = url; a.download = filename;
-      document.body.appendChild(a);
-      a.click(); // may be blocked in privacy browsers
-      a.remove();
-      showMsg('Saved to Downloads');
-      // schedule revoke; not immediate to allow download to start
-      setTimeout(()=>URL.revokeObjectURL(url), 3000);
-    } catch(e) {
-      // 3) Show visible fallback link the user can tap
-      showFallbackLink(url, filename);
+    char part[128];
+    int hlen = snprintf(part, sizeof(part),
+      "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+      (unsigned)jpg_len);
+    if (!client.write((const uint8_t*)part, hlen)) break;
+    if (!client.write((const uint8_t*)jpg_buf, jpg_len)) break;
+    if (!client.write((const uint8_t*)"\r\n", 2)) break;
+
+    if (fb) esp_camera_fb_return(fb); else if (jpg_buf) free(jpg_buf);
+
+    frames++;
+    if ((frames % 30) == 0) {
+      float sec = (esp_timer_get_time() - t0) / 1000000.0f;
+      float fps = frames / (sec > 0 ? sec : 1.0f);
+      LOGI(TAG, "Stream stats: frames=%u elapsed=%.2fs fps=%.2f",
+           (unsigned)frames, sec, fps);
     }
+    delay(1);
   }
-  // ----------------------------------------------------
-
-  // Snapshot (image-only button)
-  btnShot.onclick = async () => {
-    try{
-      syncCanvasToImage();
-      if (!cvs.width || !cvs.height) { showMsg('No frame yet'); return; }
-      ctx.drawImage(img, 0, 0, cvs.width, cvs.height);
-      cvs.toBlob(async (blob)=>{
-        if (!blob) { showMsg('Snapshot failed'); return; }
-        const ts = new Date().toISOString().replace(/[:.]/g,'-');
-        await saveBlobSmart(blob, `NozzleCAM_${ts}.jpg`, 'image/jpeg');
-      }, 'image/jpeg', 0.95);
-    }catch(e){ showMsg('Snapshot failed'); console.error(e); }
-  };
-
-  // Recording (client-side): draw frames to canvas at ~20 fps, record canvas stream
-  let rec = null, chunks = [], drawTimer = null;
-  function setRecUI(on){
-    btnRec.classList.toggle('on', on);
-    btnRec.setAttribute('aria-pressed', on ? 'true' : 'false');
-  }
-  btnRec.onclick = () => {
-    if (rec && rec.state !== 'inactive') {
-      clearInterval(drawTimer); drawTimer = null;
-      rec.stop();
-      return;
-    }
-    if (typeof MediaRecorder === 'undefined') { showMsg('Recording not supported'); return; }
-
-    syncCanvasToImage();
-    if (!cvs.width || !cvs.height) { showMsg('No frame yet'); return; }
-
-    const fps = 20;
-    drawTimer = setInterval(()=>{
-      try{
-        if (!img.complete) return;
-        if (img.naturalWidth && (img.naturalWidth !== cvs.width || img.naturalHeight !== cvs.height)) {
-          cvs.width = img.naturalWidth; cvs.height = img.naturalHeight;
-        }
-        ctx.drawImage(img, 0, 0, cvs.width, cvs.height);
-      }catch(e){}
-    }, Math.round(1000/fps));
-
-    const stream = cvs.captureStream(fps);
-    chunks = [];
-    let mime = 'video/webm;codecs=vp9';
-    if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp8';
-    if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
-
-    try {
-      rec = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: 5_000_000});
-    } catch(e) {
-      showMsg('Recording not supported'); clearInterval(drawTimer); return;
-    }
-
-    rec.ondataavailable = (ev)=>{ if (ev.data && ev.data.size) chunks.push(ev.data); };
-    rec.onstop = async ()=>{
-      const type = chunks[0]?.type || 'video/webm';
-      const blob = new Blob(chunks, { type });
-      const ts = new Date().toISOString().replace(/[:.]/g,'-');
-      await saveBlobSmart(blob, `NozzleCAM_${ts}.webm`, type);
-      setRecUI(false);
-    };
-
-    rec.start(1000);
-    setRecUI(true);
-  };
-
-  // Nudge reflow on orientation change (image scales via CSS)
-  window.addEventListener('orientationchange', () => {
-    img.style.transform='translateZ(0)'; setTimeout(()=>img.style.transform='',100);
-  });
-
-  // Initialize FS button on load
-  syncFSButton();
-</script>
-
-<!-- Toast message container -->
-<div id="msg" style="
-  position:fixed;
-  bottom:1rem;
-  left:50%;
-  transform:translateX(-50%);
-  background:#111;
-  color:#fff;
-  padding:.5rem 1rem;
-  border-radius:.5rem;
-  font-size:14px;
-  display:none;
-  z-index:999">
-</div>
-
-<script>
-function showMsg(text) {
-  const m = document.getElementById('msg');
-  m.textContent = text;
-  m.style.display = 'block';
-  setTimeout(()=>m.style.display='none', 3000);
-}
-</script>
-
-</body></html>
-)HTML";
-
-  httpd_resp_set_type(req, "text/html");
-  return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
-}
-
-// ---------- Start server (all on port 80) ----------
-static void startCameraServer(){
-  httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-  cfg.server_port = 80;
-  cfg.uri_match_fn = httpd_uri_match_wildcard;
-
-  httpd_uri_t index_uri  = { .uri="/",        .method=HTTP_GET, .handler=index_handler, .user_ctx=NULL };
-  httpd_uri_t stream_uri = { .uri="/stream",  .method=HTTP_GET, .handler=stream_handler,.user_ctx=NULL };
-
-  if (httpd_start(&httpd_ctrl, &cfg) == ESP_OK) {
-    httpd_register_uri_handler(httpd_ctrl, &index_uri);
-    httpd_register_uri_handler(httpd_ctrl, &stream_uri);
-  }
+  LOGI(TAG, "Client left /stream after %u frames", (unsigned)frames);
 }
 
 // ---------- Setup ----------
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
   Serial.begin(115200);
-  delay(100);
+  delay(150);
 
-  oledBoot();
-  oledPrintCentered("Booting...", "");
+  // Basic info
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+  LOGI(TAG, "Chip: model=%d cores=%d features=0x%x rev=%d",
+      chip.model, chip.cores, chip.features, chip.revision);
+  LOGI(TAG, "IDF version: %s", esp_get_idf_version());
+  printHeapInfo("boot");
 
-  // Ensure sensor is powered up (PWDN LOW)
-  pinMode(PWDN_GPIO_NUM, OUTPUT);
-  digitalWrite(PWDN_GPIO_NUM, LOW);
+  // Init NVS
+  esp_err_t nvs = nvs_flash_init();
+  if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    LOGW(TAG, "NVS no free pages / new version. Erasing...");
+    nvs_flash_erase();
+    nvs = nvs_flash_init();
+  }
+  if (nvs != ESP_OK) LOGE(TAG, "NVS init failed: 0x%x", nvs);
 
-  // Camera config
-  camera_config_t config;
+#ifdef IRCUT_GPIO_NUM
+  pinMode(IRCUT_GPIO_NUM, OUTPUT);
+  digitalWrite(IRCUT_GPIO_NUM, LOW);
+  LOGI(TAG, "IR-cut set LOW");
+#endif
+
+  // Camera config (OV2640)
+  camera_config_t config = {};
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
+
   config.pin_d0       = Y2_GPIO_NUM;
   config.pin_d1       = Y3_GPIO_NUM;
   config.pin_d2       = Y4_GPIO_NUM;
@@ -439,79 +228,110 @@ void setup() {
   config.pin_d5       = Y7_GPIO_NUM;
   config.pin_d6       = Y8_GPIO_NUM;
   config.pin_d7       = Y9_GPIO_NUM;
+
   config.pin_xclk     = XCLK_GPIO_NUM;
   config.pin_pclk     = PCLK_GPIO_NUM;
   config.pin_vsync    = VSYNC_GPIO_NUM;
   config.pin_href     = HREF_GPIO_NUM;
   config.pin_sccb_sda = SIOD_GPIO_NUM;
   config.pin_sccb_scl = SIOC_GPIO_NUM;
+
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 16500000;
+
+  config.xclk_freq_hz = 20000000;            // 20 MHz for OV2640 stability
   config.pixel_format = PIXFORMAT_JPEG;
 
-  if (psramFound()) {
-    config.frame_size   = STREAM_SIZE;     // UXGA
-    config.jpeg_quality = JPEG_QUALITY;    // 10
-    config.fb_count     = 2;
-    config.fb_location  = CAMERA_FB_IN_PSRAM;
-  } else {
-    config.frame_size   = FRAMESIZE_SVGA;  // safer without PSRAM
-    config.jpeg_quality = 12;
-    config.fb_count     = 1;
-    config.fb_location  = CAMERA_FB_IN_DRAM;
-  }
+  bool has_psram = psramFound();
+  LOGI(TAG, "psramFound() = %s", has_psram ? "true" : "false");
+  printHeapInfo("pre-camera");
 
+  // Start conservative, then we can raise to SVGA later
+  STREAM_SIZE = FRAMESIZE_VGA;
+  JPEG_QUALITY = 12;
+  FB_COUNT = has_psram ? 2 : 1;
+
+  config.frame_size   = STREAM_SIZE;
+  config.jpeg_quality = JPEG_QUALITY;
+  config.fb_count     = FB_COUNT;
+  config.fb_location  = has_psram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  #ifdef CAMERA_GRAB_LATEST
+    config.grab_mode  = CAMERA_GRAB_LATEST;
+  #endif
+
+  LOGI(TAG, "Camera config:");
+  LOGI(TAG, "  D0..D7: %d %d %d %d %d %d %d %d",
+      config.pin_d0, config.pin_d1, config.pin_d2, config.pin_d3,
+      config.pin_d4, config.pin_d5, config.pin_d6, config.pin_d7);
+  LOGI(TAG, "  XCLK=%d PCLK=%d VSYNC=%d HREF=%d", config.pin_xclk, config.pin_pclk, config.pin_vsync, config.pin_href);
+  LOGI(TAG, "  SCCB SDA=%d SCL=%d", config.pin_sccb_sda, config.pin_sccb_scl);
+  LOGI(TAG, "  PWDN=%d RESET=%d", config.pin_pwdn, config.pin_reset);
+  LOGI(TAG, "  xclk=%u Hz pixel_format=%d frame_size=%s jpeg_q=%d fb_count=%d fb_loc=%d",
+      (unsigned)config.xclk_freq_hz, (int)config.pixel_format, framesizeName(config.frame_size),
+      config.jpeg_quality, config.fb_count, config.fb_location);
+
+  LOGI(TAG, "Initializing camera...");
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed: 0x%x\n", err);
-    oledPrintCentered("Camera init", "FAILED");
-    delay(2000);
-  } else {
-    sensor_t* s = esp_camera_sensor_get();
-    Serial.printf("Sensor PID=0x%02X, VER=0x%02X, MIDL=0x%02X, MIDH=0x%02X\n",
-      s->id.PID, s->id.VER, s->id.MIDL, s->id.MIDH);
+    LOGE(TAG, "Camera init failed: 0x%x, retry with XCLK=24MHz & fb_count=1", err);
+    config.xclk_freq_hz = 24000000;
+    config.fb_count = 1;
+    err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+      LOGE(TAG, "Camera init failed again: 0x%x. Abort.", err);
+      return;
+    }
+  }
+  LOGI(TAG, "Camera init OK");
+  printHeapInfo("post-camera");
 
-    s->set_framesize(s, psramFound() ? STREAM_SIZE : FRAMESIZE_SVGA);
-    s->set_quality(s, JPEG_QUALITY);
-    if (s->set_colorbar) s->set_colorbar(s, 0);
-    if (s->set_gain_ctrl)     s->set_gain_ctrl(s, 1);
+  // Apply sensor params explicitly (important for OV2640)
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    LOGI(TAG, "Sensor ID: PID=0x%02x VER=0x%02x MIDH=0x%02x MIDL=0x%02x",
+        s->id.PID, s->id.VER, s->id.MIDH, s->id.MIDL);
+
+    if (s->set_framesize)   s->set_framesize(s, STREAM_SIZE);
+    if (s->set_quality)     s->set_quality(s, JPEG_QUALITY);
+    if (s->set_gain_ctrl)   s->set_gain_ctrl(s, 1);
     if (s->set_exposure_ctrl) s->set_exposure_ctrl(s, 1);
-    if (s->set_whitebal)      s->set_whitebal(s, 1);
-    if (s->set_awb_gain)      s->set_awb_gain(s, 1);
-
-    oledPrintCentered("Camera", "OK");
-    delay(400);
+    if (s->set_whitebal)    s->set_whitebal(s, 1);
+    if (s->set_awb_gain)    s->set_awb_gain(s, 1);
+    if (s->set_hmirror)     s->set_hmirror(s, 0);
+    if (s->set_vflip)       s->set_vflip(s, 0);
+  } else {
+    LOGE(TAG, "sensor_t* is NULL after init");
   }
 
-  // Wi-Fi AP
+  // Warm-up: capture & discard a few frames so pipeline is primed
+  for (int i = 0; i < 5; ++i) {
+    camera_fb_t * fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+    delay(30);
+  }
+  LOGI(TAG, "Camera warm-up complete");
+
+  // Start SoftAP
   WiFi.mode(WIFI_AP);
   bool ap_ok = WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, AP_HIDDEN, 4);
   IPAddress ip = WiFi.softAPIP();
+  LOGI(TAG, "AP %s. SSID=\"%s\" IP=%s",
+      ap_ok ? "started" : "FAILED", AP_SSID, ip.toString().c_str());
 
-  Serial.println(ap_ok ? "AP started." : "AP start failed!");
-  Serial.print("SSID: "); Serial.println(AP_SSID);
-  Serial.print("IP:   "); Serial.println(ip);
-
-  // DNS wildcard -> http://nozzlecam/
-  dnsServer.start(DNS_PORT, "*", ip);
-  Serial.println("DNS server started (wildcard): http://nozzlecam/");
-
-  // mDNS -> http://nozzcam.local/
-  if (MDNS.begin("nozzcam")) {
-    Serial.println("mDNS: http://nozzcam.local");
-  } else {
-    Serial.println("mDNS setup failed");
-  }
-
-  oledPrintCentered(AP_SSID, ip.toString());
-
-  startCameraServer();
-  Serial.println("UI:     http://192.168.4.1");
-  Serial.println("Stream: http://192.168.4.1/stream");
-  Serial.println("Also try: http://nozzlecam/  or  http://nozzcam.local/");
+  // Routes
+  server.on("/", HTTP_GET, handleIndex);
+  server.on("/stream", HTTP_GET, handleStream);
+  server.begin();
+  LOGI(TAG, "WebServer started on port 80");
+  LOGI(TAG, "Open:   http://%s/", ip.toString().c_str());
+  LOGI(TAG, "Stream: http://%s/stream", ip.toString().c_str());
 }
 
 void loop() {
-  dnsServer.processNextRequest(); // keep DNS responsive
+  static uint32_t tick = 0;
+  server.handleClient();
+  delay(1);
+  if ((++tick % 1000) == 0) {
+    printHeapInfo("loop");
+  }
 }

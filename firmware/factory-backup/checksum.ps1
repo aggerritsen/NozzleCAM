@@ -1,1 +1,1 @@
-certutil -hashfile factory_ttgo_tjournal_4MB.bin SHA256 > SHA256.txt
+certutil -hashfile factory_ttgo_camplus_16MB.bin SHA256 > SHA256CamPlus.txt
