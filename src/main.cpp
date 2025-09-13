@@ -1,10 +1,11 @@
 /**
  * T-Camera Plus S3 v1.0–v1.1 (ESP32-S3) + OV2640 + ST7789V (240x240, 1.3")
- * - Camera → Arduino WebServer: / (rich UI), /jpg, /stream, /health, /reinit
+ * - Routes: / (UI from www_index.h), /settings (form), /api/settings (GET/POST),
+ *           /jpg, /stream, /health, /reinit
  * - Wi-Fi SoftAP + DNS wildcard (http://nozzlecam/) + mDNS (http://nozzcam.local/)
  * - TFT splash: shows SSID + IP centered (Adafruit_ST7789)
  *
- * Pins per your v1.0–v1.1 table:
+ * Pins per v1.0–v1.1:
  *  Camera: RESET=IO3, VSYNC=IO4, XCLK=7, SIOD=1, SIOC=2, HREF=5, PCLK=10,
  *          D7..D0=6,8,9,11,13,15,14,12.  PWDN not present → -1.
  *  TFT ST7789V (240x240): MOSI=IO35, SCLK=IO36, CS=IO34, DC=IO45, RST=IO33, BL=IO46
@@ -22,6 +23,10 @@
 #include "esp_chip_info.h"
 #include <ESPmDNS.h>
 #include <DNSServer.h>
+#include <Preferences.h>
+
+// UI page lives here (easier to maintain separately)
+#include "www_index.h"  // extern const char INDEX_HTML[] PROGMEM;
 
 #ifdef USE_ST7789
   #include <Adafruit_GFX.h>
@@ -74,19 +79,95 @@ static const int   AP_CHANNEL  = 6;
   static Adafruit_ST7789 tft(&lcdSPI, LCD_CS, LCD_DC, LCD_RST);
 #endif
 
-// -------------------- Stream/quality defaults --------------------
+// -------------------- Settings (NVS) --------------------
+struct CamSettings {
+  uint8_t  jpeg_q;        // 10..30 (lower = better quality)
+  uint8_t  fs;            // framesize_t as uint8_t
+  int8_t   brightness;    // -2..2
+  int8_t   contrast;      // -2..2
+  int8_t   saturation;    // -2..2
+  int8_t   ae_level;      // -2..2
+  bool     awb;           // auto white balance
+  bool     aec;           // auto exposure
+  bool     agc;           // auto gain
+};
+static Preferences prefs;
+static CamSettings S;
+
+static void setDefaults(CamSettings &cs){
+  cs.jpeg_q     = 12;
+  cs.fs         = (uint8_t)FRAMESIZE_SVGA; // 800x600
+  cs.brightness = 1;
+  cs.contrast   = 0;
+  cs.saturation = 0;
+  cs.ae_level   = 1;
+  cs.awb        = true;
+  cs.aec        = true;
+  cs.agc        = true;
+}
+static void saveSettings(const CamSettings &cs){
+  prefs.begin("cam", false);
+  prefs.putUChar("q",   cs.jpeg_q);
+  prefs.putUChar("fs",  cs.fs);
+  prefs.putChar ("bri", cs.brightness);
+  prefs.putChar ("con", cs.contrast);
+  prefs.putChar ("sat", cs.saturation);
+  prefs.putChar ("ae",  cs.ae_level);
+  prefs.putBool ("awb", cs.awb);
+  prefs.putBool ("aec", cs.aec);
+  prefs.putBool ("agc", cs.agc);
+  prefs.end();
+}
+static void loadSettings(CamSettings &cs){
+  prefs.begin("cam", true);
+  if (!prefs.isKey("q")){ prefs.end(); setDefaults(cs); saveSettings(cs); return; }
+  cs.jpeg_q     = prefs.getUChar("q",   12);
+  cs.fs         = prefs.getUChar("fs",  (uint8_t)FRAMESIZE_SVGA);
+  cs.brightness = prefs.getChar ("bri", 1);
+  cs.contrast   = prefs.getChar ("con", 0);
+  cs.saturation = prefs.getChar ("sat", 0);
+  cs.ae_level   = prefs.getChar ("ae",  1);
+  cs.awb        = prefs.getBool ("awb", true);
+  cs.aec        = prefs.getBool ("aec", true);
+  cs.agc        = prefs.getBool ("agc", true);
+  prefs.end();
+}
+
+// -------------------- Stream/quality runtime --------------------
 static int         XCLK_HZ      = 24000000;          // OV2640 sweet spot
-static framesize_t STREAM_SIZE  = FRAMESIZE_SVGA;    // 800x600
-static int         JPEG_QUALITY = 12;                // 10..16 (lower = better quality)
 static int         FB_COUNT     = 2;                 // use 2 with PSRAM
+static bool        cam_ready    = false;
 
 // -------------------- Server / DNS / mDNS --------------------
 WebServer server(80);
 DNSServer dnsServer;
 const byte DNS_PORT = 53;
-static bool cam_ready = false;
 
 // -------------------- Helpers --------------------
+static const char* framesizeName(framesize_t f){
+  switch (f){
+    case FRAMESIZE_QQVGA: return "QQVGA";
+    case FRAMESIZE_QVGA:  return "QVGA";
+    case FRAMESIZE_VGA:   return "VGA";
+    case FRAMESIZE_SVGA:  return "SVGA";
+    case FRAMESIZE_XGA:   return "XGA";
+    case FRAMESIZE_SXGA:  return "SXGA";
+    case FRAMESIZE_UXGA:  return "UXGA";
+    default: return "UNK";
+  }
+}
+static framesize_t fsFromStr(const String& s){
+  if (s.equalsIgnoreCase("QQVGA")) return FRAMESIZE_QQVGA;
+  if (s.equalsIgnoreCase("QVGA"))  return FRAMESIZE_QVGA;
+  if (s.equalsIgnoreCase("VGA"))   return FRAMESIZE_VGA;
+  if (s.equalsIgnoreCase("SVGA"))  return FRAMESIZE_SVGA;
+  if (s.equalsIgnoreCase("XGA"))   return FRAMESIZE_XGA;
+  if (s.equalsIgnoreCase("SXGA"))  return FRAMESIZE_SXGA;
+  if (s.equalsIgnoreCase("UXGA"))  return FRAMESIZE_UXGA;
+  return (framesize_t)S.fs;
+}
+static int clampi(int v, int lo, int hi){ return v<lo?lo:(v>hi?hi:v); }
+
 static void sccb_recover() {
   pinMode(SIOD_GPIO_NUM, INPUT_PULLUP);
   pinMode(SIOC_GPIO_NUM, INPUT_PULLUP);
@@ -130,14 +211,29 @@ static camera_config_t make_cam_cfg(){
 
   c.xclk_freq_hz = XCLK_HZ;
   c.pixel_format = PIXFORMAT_JPEG;
-  c.frame_size   = STREAM_SIZE;
-  c.jpeg_quality = JPEG_QUALITY;
+  c.frame_size   = (framesize_t)S.fs;
+  c.jpeg_quality = S.jpeg_q;
   c.fb_count     = (psramFound() ? FB_COUNT : 1);
   c.fb_location  = psramFound() ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
 #ifdef CAMERA_GRAB_WHEN_EMPTY
   c.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
 #endif
   return c;
+}
+
+static bool applySensorParams(){
+  sensor_t* s = esp_camera_sensor_get();
+  if (!s) return false;
+  if (s->set_framesize)     s->set_framesize(s, (framesize_t)S.fs);
+  if (s->set_quality)       s->set_quality(s,   S.jpeg_q);
+  if (s->set_brightness)    s->set_brightness(s, S.brightness);
+  if (s->set_contrast)      s->set_contrast(s,   S.contrast);
+  if (s->set_saturation)    s->set_saturation(s, S.saturation);
+  if (s->set_ae_level)      s->set_ae_level(s,   S.ae_level);
+  if (s->set_whitebal)      s->set_whitebal(s,   S.awb);
+  if (s->set_exposure_ctrl) s->set_exposure_ctrl(s, S.aec);
+  if (s->set_gain_ctrl)     s->set_gain_ctrl(s,  S.agc);
+  return true;
 }
 
 static bool camera_reinit(){
@@ -157,15 +253,7 @@ static bool camera_reinit(){
     }
   }
 
-  sensor_t* s = esp_camera_sensor_get();
-  if (s){
-    if (s->set_framesize) s->set_framesize(s, STREAM_SIZE);
-    if (s->set_quality)   s->set_quality(s,   JPEG_QUALITY);
-    if (s->set_gain_ctrl) s->set_gain_ctrl(s, 1);
-    if (s->set_exposure_ctrl) s->set_exposure_ctrl(s, 1);
-    if (s->set_whitebal)  s->set_whitebal(s, 1);
-    if (s->set_awb_gain)  s->set_awb_gain(s, 1);
-  }
+  applySensorParams();
   for (int i=0;i<4;i++){ camera_fb_t* fb = esp_camera_fb_get(); if (fb) esp_camera_fb_return(fb); delay(30); }
 
   cam_ready = true;
@@ -178,13 +266,12 @@ static void tft_init_and_splash(const String &ssid, const String &ipStr) {
   pinMode(LCD_BL, OUTPUT);
   digitalWrite(LCD_BL, HIGH);
 
-  // On ESP32-S3, set SPI pins explicitly before using the display
   lcdSPI.end(); // ensure clean state
   lcdSPI.begin(LCD_SCLK, -1 /*MISO unused*/, LCD_MOSI, LCD_CS);
 
   tft.init(240, 240);            // ST7789V 240x240
-  tft.setSPISpeed(40000000);     // up to 80MHz is possible; 40MHz is safe
-  tft.setRotation(2);            // landscape (rotate as you like 0..3)
+  tft.setSPISpeed(40000000);     // 40MHz is safe
+  tft.setRotation(2);            // landscape
   tft.fillScreen(ST77XX_BLACK);
   tft.setTextWrap(false);
   tft.setTextSize(2);
@@ -209,198 +296,161 @@ static void tft_init_and_splash(const String &ssid, const String &ipStr) {
 #endif
 }
 
-// -------------------- HTTP: index (rich UI) --------------------
+// -------------------- HTTP: index (from header) --------------------
 static void handleIndex(){
-  static const char PROGMEM INDEX_HTML[] = R"HTML(
-<!doctype html><html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>NozzleCAM</title>
-<style>
-  :root,html,body{height:100%;margin:0}
-  body{background:#000;color:#fff;font-family:system-ui,Arial,sans-serif}
-  .bar{
-    position:fixed;left:0;right:0;top:0;z-index:10;
-    display:flex;gap:.5rem;align-items:center;justify-content:space-between;
-    padding:.5rem .75rem;background:rgba(0,0,0,.4);backdrop-filter:blur(6px)
-  }
-  .left, .right{display:flex;gap:.5rem;align-items:center}
-  button.icon{
-    width:42px;height:42px;padding:0;display:inline-block;
-    border:1px solid #333;border-radius:.6rem;background:#111 center/24px 24px no-repeat;
-    cursor:pointer;outline:none
-  }
-  button.icon:focus-visible{box-shadow:0 0 0 2px #09f6}
-  button.icon:hover{background-color:#141414}
-  button.icon:active{transform:translateY(1px)}
-  button.icon.toggle.on{box-shadow:inset 0 0 0 2px #0af}
-  button.icon{background-image:var(--img)}
-  #shot{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%23fff' d='M9 4l1.5 2H18a2 2 0 012 2v8a2 2 0 01-2 2H6a2 2 0 01-2-2V8a2 2 0 012-2h2.5L9 4zm3 4a5 5 0 100 10 5 5 0 000-10zm0 2a3 3 0 110 6 3 3 0 010-6z'/></svg>")}
-  #rec{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><circle cx='12' cy='12' r='6' fill='%23e53935'/></svg>")}
-  #rec.on{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='7' y='7' width='10' height='10' rx='2' fill='%23e53935'/></svg>")}
-  #fs{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%23fff' d='M4 9V4h5v2H6v3H4zm10-5h5v5h-2V6h-3V4zM4 15h2v3h3v2H4v-5zm13 3v-3h2v5h-5v-2h3z'/></svg>")}
-  #fs.on{--img:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='%23fff' d='M9 7V4H4v5h2V7h3zm9 2h2V4h-5v3h3v2zM7 15H4v5h5v-2H7v-3zm10 3h-3v2h5v-5h-2v3z'/></svg>")}
-  #dl{ display:none }
-  #stage{position:fixed;inset:0;display:flex;align-items:center;justify-content:center}
-  #stream{display:block;width:100vw;height:100vh;object-fit:contain;background:#000;touch-action:none}
-  canvas{display:none}
-</style>
-</head><body>
-  <div class="bar">
-    <div class="left"><strong>NozzleCAM</strong></div>
-    <div class="right">
-      <a id="dl" class="btn" download>Save file…</a>
-      <button id="shot" class="icon" aria-label="Snapshot" title="Snapshot"></button>
-      <button id="rec" class="icon toggle" aria-label="Record" title="Record" aria-pressed="false"></button>
-      <button id="fs"  class="icon toggle" aria-label="Fullscreen" title="Fullscreen" aria-pressed="false"></button>
-    </div>
-  </div>
-  <div id="stage">
-    <img id="stream" alt="Live stream">
-    <canvas id="cvs"></canvas>
-  </div>
-<script>
-  const img  = document.getElementById('stream');
-  const cvs  = document.getElementById('cvs');
-  const ctx  = cvs.getContext('2d');
-  const dl   = document.getElementById('dl');
-  const btnShot = document.getElementById('shot');
-  const btnRec  = document.getElementById('rec');
-  const btnFS   = document.getElementById('fs');
+  server.setContentLength(strlen_P(INDEX_HTML));
+  server.send_P(200, "text/html", INDEX_HTML);
+}
 
-  const streamURL = '/stream';
-  img.src = streamURL;
+// -------------------- HTTP: settings (HTML form UI) --------------------
+static void sendSettingsPage(){
+  char html[4096];
+  framesize_t fs = (framesize_t)S.fs;
+  snprintf(html, sizeof(html),
+    "<!doctype html><html><head><meta charset=utf-8>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>NozzleCAM Settings</title>"
+    "<style>body{font-family:system-ui;margin:1rem;background:#111;color:#eee}"
+    "label{display:block;margin:.5rem 0 .2rem}input,select,button{font:inherit;padding:.4rem .5rem;border-radius:.4rem;border:1px solid #444;background:#1a1a1a;color:#eee}"
+    "form{max-width:520px} fieldset{border:1px solid #333;border-radius:.6rem;padding:1rem;margin-bottom:1rem}"
+    "legend{padding:0 .4rem} .row{display:flex;gap:.6rem} .row>div{flex:1}</style>"
+    "</head><body><h2>NozzleCAM Settings</h2>"
+    "<form method='POST' action='/settings'>"
+      "<fieldset><legend>Image</legend>"
+        "<label>Frame size</label>"
+        "<select name='fs'>"
+          "<option value='QQVGA'%s>QQVGA</option>"
+          "<option value='QVGA'%s>QVGA</option>"
+          "<option value='VGA'%s>VGA</option>"
+          "<option value='SVGA'%s>SVGA</option>"
+          "<option value='XGA'%s>XGA</option>"
+          "<option value='SXGA'%s>SXGA</option>"
+          "<option value='UXGA'%s>UXGA</option>"
+        "</select>"
+        "<label>JPEG quality (lower=better)</label>"
+        "<input type='number' min='10' max='30' name='q' value='%u'>"
+      "</fieldset>"
+      "<fieldset><legend>Tuning</legend>"
+        "<div class='row'>"
+          "<div><label>Brightness</label><input type='number' min='-2' max='2' name='bri' value='%d'></div>"
+          "<div><label>Contrast</label><input type='number' min='-2' max='2' name='con' value='%d'></div>"
+        "</div>"
+        "<div class='row'>"
+          "<div><label>Saturation</label><input type='number' min='-2' max='2' name='sat' value='%d'></div>"
+          "<div><label>AE Level</label><input type='number' min='-2' max='2' name='ae' value='%d'></div>"
+        "</div>"
+        "<div class='row'>"
+          "<div><label>AWB</label><select name='awb'><option value='1'%s>On</option><option value='0'%s>Off</option></select></div>"
+          "<div><label>AEC</label><select name='aec'><option value='1'%s>On</option><option value='0'%s>Off</option></select></div>"
+          "<div><label>AGC</label><select name='agc'><option value='1'%s>On</option><option value='0'%s>Off</option></select></div>"
+        "</div>"
+      "</fieldset>"
+      "<p><button type='submit'>Apply & Save</button> <a href='/' style='margin-left:.6rem'>Back to UI</a></p>"
+    "</form>"
+    "<p style='opacity:.7'>Current: fs=%s q=%u bri=%d con=%d sat=%d ae=%d awb=%d aec=%d agc=%d</p>"
+    "</body></html>",
+    (fs==FRAMESIZE_QQVGA)?" selected":"",
+    (fs==FRAMESIZE_QVGA) ?" selected":"",
+    (fs==FRAMESIZE_VGA)  ?" selected":"",
+    (fs==FRAMESIZE_SVGA) ?" selected":"",
+    (fs==FRAMESIZE_XGA)  ?" selected":"",
+    (fs==FRAMESIZE_SXGA) ?" selected":"",
+    (fs==FRAMESIZE_UXGA) ?" selected":"",
+    S.jpeg_q, S.brightness, S.contrast, S.saturation, S.ae_level,
+    S.awb?" selected":"", (!S.awb)?" selected":"",
+    S.aec?" selected":"", (!S.aec)?" selected":"",
+    S.agc?" selected":"", (!S.agc)?" selected":"",
+    framesizeName((framesize_t)S.fs), S.jpeg_q, S.brightness, S.contrast, S.saturation, S.ae_level,
+    S.awb, S.aec, S.agc
+  );
+  server.send(200, "text/html", html);
+}
+static void handleSettingsGet(){ sendSettingsPage(); }
 
-  function syncFSButton(){
-    const on = !!document.fullscreenElement;
-    btnFS.classList.toggle('on', on);
-    btnFS.setAttribute('aria-pressed', on ? 'true' : 'false');
-  }
-  btnFS.onclick = () => {
-    const el = document.documentElement;
-    if (document.fullscreenElement) document.exitFullscreen();
-    else if (el.requestFullscreen) el.requestFullscreen();
-  };
-  document.addEventListener('fullscreenchange', syncFSButton);
+static void handleSettingsPost(){
+  String fs  = server.arg("fs");
+  String q   = server.arg("q");
+  String bri = server.arg("bri");
+  String con = server.arg("con");
+  String sat = server.arg("sat");
+  String ae  = server.arg("ae");
+  String awb = server.arg("awb");
+  String aec = server.arg("aec");
+  String agc = server.arg("agc");
 
-  function syncCanvasToImage(){
-    const w = img.naturalWidth || img.videoWidth || img.width;
-    const h = img.naturalHeight || img.videoHeight || img.height;
-    if (w && h && (cvs.width !== w || cvs.height !== h)) { cvs.width = w; cvs.height = h; }
-  }
+  S.fs         = (uint8_t)fsFromStr(fs);
+  S.jpeg_q     = (uint8_t)clampi(q.toInt(),    10, 30);
+  S.brightness = (int8_t)clampi(bri.toInt(),   -2,  2);
+  S.contrast   = (int8_t)clampi(con.toInt(),   -2,  2);
+  S.saturation = (int8_t)clampi(sat.toInt(),   -2,  2);
+  S.ae_level   = (int8_t)clampi(ae.toInt(),    -2,  2);
+  S.awb        = (awb=="1");
+  S.aec        = (aec=="1");
+  S.agc        = (agc=="1");
 
-  let lastURL = null;
-  function showFallbackLink(url, filename){
-    if (lastURL && lastURL !== url) { try { URL.revokeObjectURL(lastURL); } catch(e){} }
-    lastURL = url;
-    dl.href = url; dl.download = filename; dl.style.display = 'inline-block';
-    showMsg('Tap "Save file…" to store locally');
-  }
+  saveSettings(S);
+  applySensorParams();
+  // If big FS jumps cause instability, you can call camera_reinit() here.
 
-  async function saveBlobSmart(blob, filename, mime){
-    const file = new File([blob], filename, { type: mime });
-    try {
-      if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: 'NozzleCAM' });
-        showMsg('Shared'); return;
-      }
-    } catch(e) {}
-    const url = URL.createObjectURL(blob);
-    try {
-      const a = document.createElement('a');
-      a.href = url; a.download = filename;
-      document.body.appendChild(a); a.click(); a.remove();
-      showMsg('Saved to Downloads');
-      setTimeout(()=>URL.revokeObjectURL(url), 3000);
-    } catch(e) {
-      showFallbackLink(url, filename);
-    }
-  }
+  server.sendHeader("Location", "/settings", true);
+  server.send(303, "text/plain", "");
+}
 
-  btnShot.onclick = async () => {
-    try{
-      syncCanvasToImage();
-      if (!cvs.width || !cvs.height) { showMsg('No frame yet'); return; }
-      ctx.drawImage(img, 0, 0, cvs.width, cvs.height);
-      cvs.toBlob(async (blob)=>{
-        if (!blob) { showMsg('Snapshot failed'); return; }
-        const ts = new Date().toISOString().replace(/[:.]/g,'-');
-        await saveBlobSmart(blob, `NozzleCAM_${ts}.jpg`, 'image/jpeg');
-      }, 'image/jpeg', 0.95);
-    }catch(e){ showMsg('Snapshot failed'); }
-  };
-
-  let rec = null, chunks = [], drawTimer = null;
-  function setRecUI(on){
-    btnRec.classList.toggle('on', on);
-    btnRec.setAttribute('aria-pressed', on ? 'true' : 'false');
-  }
-  btnRec.onclick = () => {
-    if (rec && rec.state !== 'inactive') {
-      clearInterval(drawTimer); drawTimer = null; rec.stop(); return;
-    }
-    if (typeof MediaRecorder === 'undefined') { showMsg('Recording not supported'); return; }
-    syncCanvasToImage();
-    if (!cvs.width || !cvs.height) { showMsg('No frame yet'); return; }
-
-    const fps = 20;
-    drawTimer = setInterval(()=>{
-      try{
-        if (!img.complete) return;
-        if (img.naturalWidth && (img.naturalWidth !== cvs.width || img.naturalHeight !== cvs.height)) {
-          cvs.width = img.naturalWidth; cvs.height = img.naturalHeight;
-        }
-        ctx.drawImage(img, 0, 0, cvs.width, cvs.height);
-      }catch(e){}
-    }, Math.round(1000/fps));
-
-    const stream = cvs.captureStream(fps);
-    chunks = [];
-    let mime = 'video/webm;codecs=vp9';
-    if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp8';
-    if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
-    try {
-      rec = new MediaRecorder(stream, {mimeType: mime, videoBitsPerSecond: 5_000_000});
-    } catch(e) {
-      showMsg('Recording not supported'); clearInterval(drawTimer); return;
-    }
-    rec.ondataavailable = (ev)=>{ if (ev.data && ev.data.size) chunks.push(ev.data); };
-    rec.onstop = async ()=>{
-      const type = chunks[0]?.type || 'video/webm';
-      const blob = new Blob(chunks, { type });
-      const ts = new Date().toISOString().replace(/[:.]/g,'-');
-      await saveBlobSmart(blob, `NozzleCAM_${ts}.webm`, type);
-      setRecUI(false);
+// -------------------- HTTP: JSON API for settings --------------------
+static void handleApiGet(){
+  char buf[256];
+  framesize_t fs = (framesize_t)S.fs;
+  snprintf(buf, sizeof(buf),
+    "{"
+      "\"fs\":\"%s\",\"q\":%u,"
+      "\"bri\":%d,\"con\":%d,\"sat\":%d,\"ae\":%d,"
+      "\"awb\":%d,\"aec\":%d,\"agc\":%d"
+    "}",
+    framesizeName(fs), S.jpeg_q, S.brightness, S.contrast, S.saturation, S.ae_level,
+    S.awb, S.aec, S.agc
+  );
+  server.send(200, "application/json", buf);
+}
+static void handleApiPost(){
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    auto findInt = [&](const char* k, int def)->int{
+      int p = body.indexOf(String("\"")+k+"\"");
+      if (p<0) return def;
+      p = body.indexOf(':', p); if (p<0) return def;
+      int e = body.indexOf(',', p+1); if (e<0) e = body.indexOf('}', p+1);
+      if (e<0) return def;
+      return body.substring(p+1, e).toInt();
     };
-    rec.start(1000);
-    setRecUI(true);
-  };
+    auto findStr = [&](const char* k, String def)->String{
+      int p = body.indexOf(String("\"")+k+"\"");
+      if (p<0) return def;
+      p = body.indexOf(':', p); if (p<0) return def;
+      int q1 = body.indexOf('"', p+1); if (q1<0) return def;
+      int q2 = body.indexOf('"', q1+1); if (q2<0) return def;
+      return body.substring(q1+1, q2);
+    };
 
-  window.addEventListener('orientationchange', () => {
-    img.style.transform='translateZ(0)'; setTimeout(()=>img.style.transform='',100);
-  });
-  syncFSButton();
-</script>
+    String fs = findStr("fs", framesizeName((framesize_t)S.fs));
+    S.fs         = (uint8_t)fsFromStr(fs);
+    S.jpeg_q     = (uint8_t)clampi(findInt("q",  S.jpeg_q), 10, 30);
+    S.brightness = (int8_t)clampi(findInt("bri",S.brightness), -2, 2);
+    S.contrast   = (int8_t)clampi(findInt("con",S.contrast),   -2, 2);
+    S.saturation = (int8_t)clampi(findInt("sat",S.saturation), -2, 2);
+    S.ae_level   = (int8_t)clampi(findInt("ae", S.ae_level),   -2, 2);
+    S.awb        = findInt("awb", S.awb) ? true:false;
+    S.aec        = findInt("aec", S.aec) ? true:false;
+    S.agc        = findInt("agc", S.agc) ? true:false;
 
-<div id="msg" style="
-  position:fixed; bottom:1rem; left:50%; transform:translateX(-50%);
-  background:#111; color:#fff; padding:.5rem 1rem; border-radius:.5rem;
-  font-size:14px; display:none; z-index:999"></div>
-<script>
-function showMsg(text) {
-  const m = document.getElementById('msg');
-  m.textContent = text;
-  m.style.display = 'block';
-  setTimeout(()=>m.style.display='none', 3000);
+    saveSettings(S);
+    applySensorParams();
+    server.send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+  handleSettingsPost();
 }
-</script>
-</body></html>
-)HTML";
-  server.setContentLength(strlen(INDEX_HTML));
-  server.send(200, "text/html", INDEX_HTML);
-}
 
-// -------------------- HTTP: health --------------------
+// -------------------- HTTP: health / reinit / jpg / stream --------------------
 static void handleHealth(){
   bool ok = false;
   if (cam_ready){
@@ -417,14 +467,10 @@ static void handleHealth(){
            ok?"true":"false", (unsigned)fi, (unsigned)fp);
   server.send(ok?200:500, "application/json", buf);
 }
-
-// -------------------- HTTP: reinit --------------------
 static void handleReinit(){
   bool ok = camera_reinit();
   server.send(ok?200:500, "text/plain", ok ? "reinit ok" : "reinit failed");
 }
-
-// -------------------- HTTP: single JPEG --------------------
 static void handleJpg(){
   if (!cam_ready){ server.send(503, "text/plain", "cam not ready"); return; }
   camera_fb_t* fb = esp_camera_fb_get();
@@ -432,7 +478,7 @@ static void handleJpg(){
 
   uint8_t* jpg = nullptr; size_t len = 0;
   if (fb->format != PIXFORMAT_JPEG){
-    bool ok = frame2jpg(fb, JPEG_QUALITY, &jpg, &len);
+    bool ok = frame2jpg(fb, S.jpeg_q, &jpg, &len);
     esp_camera_fb_return(fb); fb=nullptr;
     if (!ok){ server.send(500, "text/plain", "frame2jpg failed"); return; }
   } else { jpg = fb->buf; len = fb->len; }
@@ -443,8 +489,6 @@ static void handleJpg(){
 
   if (fb) esp_camera_fb_return(fb); else if (jpg) free(jpg);
 }
-
-// -------------------- HTTP: MJPEG stream --------------------
 static void handleStream(){
   if (!cam_ready){ server.send(503, "text/plain", "cam not ready"); return; }
   WiFiClient client = server.client(); if (!client) return;
@@ -469,7 +513,7 @@ static void handleStream(){
 
     uint8_t* jpg = nullptr; size_t len = 0;
     if (fb->format != PIXFORMAT_JPEG){
-      bool ok = frame2jpg(fb, JPEG_QUALITY, &jpg, &len);
+      bool ok = frame2jpg(fb, S.jpeg_q, &jpg, &len);
       esp_camera_fb_return(fb); fb=nullptr;
       if (!ok) break;
     } else { jpg = fb->buf; len = fb->len; }
@@ -492,6 +536,7 @@ void setup(){
   delay(150);
 
   if (nvs_flash_init()!=ESP_OK){ nvs_flash_erase(); nvs_flash_init(); }
+  loadSettings(S);
 
   cam_ready = camera_reinit();
   if (!cam_ready) LOGE(TAG, "Camera failed to init");
@@ -513,18 +558,27 @@ void setup(){
     Serial.println("mDNS setup failed");
   }
 
+#ifdef USE_ST7789
+  // Show splash on the TFT
   tft_init_and_splash(AP_SSID, ip.toString());
+#endif
 
-  server.on("/",        HTTP_GET, handleIndex);
-  server.on("/health",  HTTP_GET, handleHealth);
-  server.on("/reinit",  HTTP_GET, handleReinit);
-  server.on("/jpg",     HTTP_GET, handleJpg);
-  server.on("/stream",  HTTP_GET, handleStream);
+  // Routes
+  server.on("/",             HTTP_GET, handleIndex);
+  server.on("/settings",     HTTP_GET, handleSettingsGet);
+  server.on("/settings",     HTTP_POST, handleSettingsPost);
+  server.on("/api/settings", HTTP_GET, handleApiGet);
+  server.on("/api/settings", HTTP_POST, handleApiPost);
+  server.on("/health",       HTTP_GET, handleHealth);
+  server.on("/reinit",       HTTP_GET, handleReinit);
+  server.on("/jpg",          HTTP_GET, handleJpg);
+  server.on("/stream",       HTTP_GET, handleStream);
   server.begin();
 
   Serial.println("UI:     http://192.168.4.1");
   Serial.println("Stream: http://192.168.4.1/stream");
   Serial.println("Also try: http://nozzlecam/  or  http://nozzcam.local/");
+  Serial.println("Settings: http://192.168.4.1/settings");
 }
 
 // -------------------- Loop --------------------
